@@ -270,23 +270,54 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     if (albumsProvider == Nil || ![self isKindOfClass:albumsProvider]) {
         return gadgets;
     }
-    NSMutableArray *kept = [NSMutableArray arrayWithCapacity:gadgets.count];
+    // The list is left as it is (its cells are keyed by position); the album is
+    // hidden by giving its card no size, see below.
     for (id gadget in gadgets) {
         RecordAlbumFromGadget(gadget);
-        PHAssetCollection *collection = nil;
-        @try {
-            if ([gadget respondsToSelector:@selector(collection)]) {
-                collection = [(PUAlbumGadget *)gadget collection];
-            }
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
-        if (collection != nil && AlbumIsHidden(collection)) {
-            continue;
-        }
-        [kept addObject:gadget];
     }
-    return kept;
+    return gadgets;
+}
+
+// A hidden album's card is sized to nothing: the array keeps its positions, so
+// no other card shifts into the wrong place.
+@interface PUHorizontalAlbumListGadget : NSObject
+@end
+
+static PHAssetCollection *AlbumAtIndexPath(id albumListGadget, NSIndexPath *indexPath) {
+    id provider = nil;
+    @try {
+        provider = [albumListGadget valueForKey:@"provider"];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (provider == nil || ![provider respondsToSelector:@selector(gadgetForIndexPath:)]) {
+        return nil;
+    }
+    id gadget = nil;
+    @try {
+        gadget = [(id)provider performSelector:@selector(gadgetForIndexPath:) withObject:indexPath];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (gadget != nil && [gadget respondsToSelector:@selector(collection)]) {
+        return [(PUAlbumGadget *)gadget collection];
+    }
+    return nil;
+}
+
+static CGSize (*OriginalSizeForItemAtIndexPath)(id, SEL, UICollectionView *, UICollectionViewLayout *,
+                                                NSIndexPath *);
+
+static CGSize HookedSizeForItemAtIndexPath(id self, SEL _cmd, UICollectionView *collectionView,
+                                           UICollectionViewLayout *layout, NSIndexPath *indexPath) {
+    Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
+    if (albumListClass != Nil && [self isKindOfClass:albumListClass]) {
+        PHAssetCollection *collection = AlbumAtIndexPath(self, indexPath);
+        if (collection != nil && AlbumIsHidden(collection)) {
+            return CGSizeMake(0, 0);
+        }
+    }
+    return OriginalSizeForItemAtIndexPath(self, _cmd, collectionView, layout, indexPath);
 }
 
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
@@ -339,5 +370,17 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     if (albumsProvider != Nil &&
         class_getInstanceMethod(albumsProvider, @selector(_newGadgetForCollection:)) != NULL) {
         // Kept unhooked: returning nil from this creation point terminates Photos.
+    }
+
+    Class collectionViewClass = objc_getClass("UICollectionView");
+    if (collectionViewClass != Nil) {
+        (void)collectionViewClass;
+    }
+
+    Class albumList = objc_getClass("PUHorizontalAlbumListGadget");
+    if (albumList != Nil &&
+        class_getInstanceMethod(albumList, @selector(collectionView:layout:sizeForItemAtIndexPath:)) != NULL) {
+        MSHookMessageEx(albumList, @selector(collectionView:layout:sizeForItemAtIndexPath:),
+                        (IMP)HookedSizeForItemAtIndexPath, (IMP *)&OriginalSizeForItemAtIndexPath);
     }
 }
