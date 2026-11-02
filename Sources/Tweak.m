@@ -307,15 +307,10 @@ static UICollectionViewCell *HookedCellForItemAtIndexPath(id self, SEL _cmd,
     // itself, nothing is hard-coded.
     NSUInteger hiddenBefore = HiddenAlbumCountBefore(self, indexPath);
     CGAffineTransform transform = cell.transform;
-    if (hiddenBefore > 0) {
-        CGFloat step = AlbumCardStep(self, collectionView, indexPath);
-        transform.tx = -(CGFloat)hiddenBefore * step;
-        transform.ty = 0;
-    } else {
-        transform.tx = 0;
-        transform.ty = 0;
-    }
+    transform.tx = 0;
+    transform.ty = 0;
     cell.transform = transform;
+    (void)hiddenBefore;
     return cell;
 }
 
@@ -373,6 +368,76 @@ static PHAssetCollection *AlbumAtGadgetIndexPath(id horizontalGadget, NSIndexPat
         return [(PUAlbumGadget *)gadget collection];
     }
     return nil;
+}
+
+// The album row is a two-row layout: item i sits at column i/2, row i%2. A
+// hidden album is dropped from that sequence, so every visible card after it is
+// given an earlier slot. Metrics come from the layout's own attributes.
+static char kDoubleHeightMetricsKey;
+
+static PHAssetCollection *AlbumAtIndexPath(id albumListGadget, NSIndexPath *indexPath);
+
+static UICollectionViewLayoutAttributes *(*OriginalDoubleHeightItem)(id, SEL, NSIndexPath *);
+
+static BOOL AlbumLayoutMetrics(id layout, SEL _cmd, CGFloat *columnStep, CGFloat *rowOffset) {
+    NSArray *cached = objc_getAssociatedObject(layout, &kDoubleHeightMetricsKey);
+    if ([cached isKindOfClass:[NSArray class]] && cached.count == 2) {
+        *columnStep = [cached[0] doubleValue];
+        *rowOffset = [cached[1] doubleValue];
+        return *columnStep > 0 && *rowOffset > 0;
+    }
+    NSIndexPath *first = [NSIndexPath indexPathForItem:0 inSection:0];
+    UICollectionViewLayoutAttributes *a0 = OriginalDoubleHeightItem(layout, _cmd, first);
+    UICollectionViewLayoutAttributes *a1 =
+        OriginalDoubleHeightItem(layout, _cmd, [NSIndexPath indexPathForItem:1 inSection:0]);
+    UICollectionViewLayoutAttributes *a2 =
+        OriginalDoubleHeightItem(layout, _cmd, [NSIndexPath indexPathForItem:2 inSection:0]);
+    if (a0 == nil || a1 == nil || a2 == nil) {
+        return NO;
+    }
+    *columnStep = a2.frame.origin.x - a0.frame.origin.x;
+    *rowOffset = a1.frame.origin.y - a0.frame.origin.y;
+    if (*columnStep <= 0 || *rowOffset <= 0) {
+        return NO;
+    }
+    objc_setAssociatedObject(layout, &kDoubleHeightMetricsKey,
+                             @[@(*columnStep), @(*rowOffset)],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
+static UICollectionViewLayoutAttributes *HookedDoubleHeightItem(id self, SEL _cmd, NSIndexPath *indexPath) {
+    UICollectionViewLayoutAttributes *attributes = OriginalDoubleHeightItem(self, _cmd, indexPath);
+    id dataSource = nil;
+    @try {
+        dataSource = [[self valueForKey:@"collectionView"] dataSource];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
+    if (dataSource == nil || albumListClass == Nil || ![dataSource isKindOfClass:albumListClass]) {
+        return attributes;
+    }
+    PHAssetCollection *collection = AlbumAtIndexPath(dataSource, indexPath);
+    if (collection != nil && AlbumIsHidden(collection)) {
+        attributes.hidden = YES;
+        return attributes;
+    }
+    NSUInteger hiddenBefore = HiddenAlbumCountBefore(dataSource, indexPath);
+    if (hiddenBefore == 0) {
+        return attributes;
+    }
+    CGFloat columnStep = 0;
+    CGFloat rowOffset = 0;
+    if (!AlbumLayoutMetrics(self, _cmd, &columnStep, &rowOffset)) {
+        return attributes;
+    }
+    NSUInteger slot = (NSUInteger)indexPath.item - hiddenBefore;
+    CGRect frame = attributes.frame;
+    frame.origin.x = (CGFloat)(slot / 2) * columnStep;
+    frame.origin.y = (CGFloat)(slot % 2) * rowOffset;
+    attributes.frame = frame;
+    return attributes;
 }
 
 static char kProviderDumpOnceKey;
@@ -681,6 +746,13 @@ __attribute__((constructor)) static void TweakInitialize(void) {
         MSHookMessageEx(horizontalGadget, @selector(collectionView:cellForItemAtIndexPath:),
                         (IMP)HookedCellForItemAtIndexPath,
                         (IMP *)&OriginalCellForItemAtIndexPath);
+    }
+
+    Class doubleHeightLayout = objc_getClass("PUDoubleHeightHorizontalAlbumListGadgetLayout");
+    if (doubleHeightLayout != Nil &&
+        class_getInstanceMethod(doubleHeightLayout, @selector(layoutAttributesForItemAtIndexPath:)) != NULL) {
+        MSHookMessageEx(doubleHeightLayout, @selector(layoutAttributesForItemAtIndexPath:),
+                        (IMP)HookedDoubleHeightItem, (IMP *)&OriginalDoubleHeightItem);
     }
 
     ProbeCellDataSource();
