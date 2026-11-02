@@ -26,6 +26,7 @@
 #import <notify.h>
 #import <objc/runtime.h>
 #import <os/log.h>
+#import <stdlib.h>
 #import <substrate.h>
 
 #import "ApelinBootstrap.h"
@@ -129,12 +130,30 @@ static BOOL HiddenContentsEnabled(void) {
     return gEnabled;
 }
 
+// Applies a changed setting: when the value really differs from the one this
+// process has been using, the process ends itself, so the next launch of Photos
+// starts from the new value with nothing stale left behind.
+static void ApplySettingFromPreferences(void) {
+    BOOL enabled = ReadEnabledFromPreferences();
+    BOOL changed = gLoaded && enabled != gEnabled;
+    gEnabled = enabled;
+    gLoaded = YES;
+    if (!changed) {
+        return;
+    }
+    FileLog(@"setting changed to enabled=%d, ending this process", enabled ? 1 : 0);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        exit(0);
+    });
+}
+
 // The pane posts <package id>/changed on the Darwin notification center.
 static void SettingChangedCallback(CFNotificationCenterRef center, void *observer,
                                    CFStringRef name, const void *object,
                                    CFDictionaryRef userInfo) {
     (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
-    gLoaded = NO;
+    ApplySettingFromPreferences();
 }
 
 static void StartListeningForSettingChanges(void) {
@@ -152,7 +171,7 @@ static void StartListeningForSettingChanges(void) {
                          queue:nil
                     usingBlock:^(NSNotification *note) {
             (void)note;
-            gLoaded = NO;
+            ApplySettingFromPreferences();
         }];
     });
 }
