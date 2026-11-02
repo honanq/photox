@@ -278,48 +278,9 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     return gadgets;
 }
 
-// A hidden album's card is sized to nothing: the array keeps its positions, so
-// no other card shifts into the wrong place.
-@interface PUHorizontalAlbumListGadget : NSObject
-@end
-
-static PHAssetCollection *AlbumAtIndexPath(id albumListGadget, NSIndexPath *indexPath) {
-    id provider = nil;
-    @try {
-        provider = [albumListGadget valueForKey:@"provider"];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    if (provider == nil || ![provider respondsToSelector:@selector(gadgetForIndexPath:)]) {
-        return nil;
-    }
-    id gadget = nil;
-    @try {
-        gadget = [(id)provider performSelector:@selector(gadgetForIndexPath:) withObject:indexPath];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    if (gadget != nil && [gadget respondsToSelector:@selector(collection)]) {
-        return [(PUAlbumGadget *)gadget collection];
-    }
-    return nil;
-}
-
-static CGSize (*OriginalSizeForItemAtIndexPath)(id, SEL, UICollectionView *, UICollectionViewLayout *,
-                                                NSIndexPath *);
-
-static CGSize HookedSizeForItemAtIndexPath(id self, SEL _cmd, UICollectionView *collectionView,
-                                           UICollectionViewLayout *layout, NSIndexPath *indexPath) {
-    Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
-    if (albumListClass != Nil && [self isKindOfClass:albumListClass]) {
-        PHAssetCollection *collection = AlbumAtIndexPath(self, indexPath);
-        if (collection != nil && AlbumIsHidden(collection)) {
-            return CGSizeMake(0, 0);
-        }
-    }
-    return OriginalSizeForItemAtIndexPath(self, _cmd, collectionView, layout, indexPath);
-}
-
+// A hidden album's card cannot be dropped from the list (cards shift) nor sized
+// to nothing (the layout breaks), so per-album hiding waits for a data-source
+// level answer.
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
     if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
         MSHookMessageEx(cls, selector, hook, original);
@@ -378,9 +339,9 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     }
 
     Class albumList = objc_getClass("PUHorizontalAlbumListGadget");
-    if (albumList != Nil &&
-        class_getInstanceMethod(albumList, @selector(collectionView:layout:sizeForItemAtIndexPath:)) != NULL) {
-        MSHookMessageEx(albumList, @selector(collectionView:layout:sizeForItemAtIndexPath:),
-                        (IMP)HookedSizeForItemAtIndexPath, (IMP *)&OriginalSizeForItemAtIndexPath);
+    if (albumList != Nil) {
+        // Left unhooked: zero-sizing a card corrupts the whole list layout, and
+        // removing elements shifts every card after it. Per-album hiding needs a
+        // data-source level answer, which is still to be found.
     }
 }
