@@ -278,9 +278,77 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     return gadgets;
 }
 
-// A hidden album's card cannot be dropped from the list (cards shift) nor sized
-// to nothing (the layout breaks), so per-album hiding waits for a data-source
-// level answer.
+// A hidden album's card cannot be dropped from the list (its neighbours shift)
+// nor resized to nothing (the layout breaks), so it is laid out hidden: the cell
+// stays in place for indexing and simply is not drawn.
+static PHAssetCollection *AlbumAtIndexPath(id albumListGadget, NSIndexPath *indexPath) {
+    id provider = nil;
+    @try {
+        provider = [albumListGadget valueForKey:@"provider"];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (provider == nil || ![provider respondsToSelector:@selector(gadgetForIndexPath:)]) {
+        return nil;
+    }
+    id gadget = nil;
+    @try {
+        gadget = [(id)provider performSelector:@selector(gadgetForIndexPath:) withObject:indexPath];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (gadget != nil && [gadget respondsToSelector:@selector(collection)]) {
+        return [(PUAlbumGadget *)gadget collection];
+    }
+    return nil;
+}
+
+static UICollectionViewLayoutAttributes *(*OriginalLayoutAttributesForItem)(id, SEL, NSIndexPath *);
+static char kAlbumListLayoutKey;
+
+static UICollectionViewLayoutAttributes *HookedLayoutAttributesForItem(id self, SEL _cmd,
+                                                                      NSIndexPath *indexPath) {
+    UICollectionViewLayoutAttributes *attributes = OriginalLayoutAttributesForItem(self, _cmd, indexPath);
+    Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
+    if (albumListClass == Nil) {
+        return attributes;
+    }
+    // Whether this layout belongs to the album list is asked once per layout.
+    NSNumber *cached = objc_getAssociatedObject(self, &kAlbumListLayoutKey);
+    id dataSource = nil;
+    if (cached == nil) {
+        @try {
+            UICollectionView *collectionView = [self valueForKey:@"collectionView"];
+            dataSource = collectionView.dataSource;
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        BOOL isAlbumList = dataSource != nil && [dataSource isKindOfClass:albumListClass];
+        objc_setAssociatedObject(self, &kAlbumListLayoutKey, @(isAlbumList),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!isAlbumList) {
+            return attributes;
+        }
+    } else if (!cached.boolValue) {
+        return attributes;
+    } else {
+        @try {
+            UICollectionView *collectionView = [self valueForKey:@"collectionView"];
+            dataSource = collectionView.dataSource;
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+    }
+    if (dataSource == nil) {
+        return attributes;
+    }
+    PHAssetCollection *collection = AlbumAtIndexPath(dataSource, indexPath);
+    if (collection != nil && AlbumIsHidden(collection)) {
+        attributes.hidden = YES;
+    }
+    return attributes;
+}
+
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
     if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
         MSHookMessageEx(cls, selector, hook, original);
@@ -340,8 +408,13 @@ __attribute__((constructor)) static void TweakInitialize(void) {
 
     Class albumList = objc_getClass("PUHorizontalAlbumListGadget");
     if (albumList != Nil) {
-        // Left unhooked: zero-sizing a card corrupts the whole list layout, and
-        // removing elements shifts every card after it. Per-album hiding needs a
-        // data-source level answer, which is still to be found.
+        (void)albumList;
+    }
+
+    Class layoutClass = objc_getClass("UICollectionViewLayout");
+    if (layoutClass != Nil &&
+        class_getInstanceMethod(layoutClass, @selector(layoutAttributesForItemAtIndexPath:)) != NULL) {
+        MSHookMessageEx(layoutClass, @selector(layoutAttributesForItemAtIndexPath:),
+                        (IMP)HookedLayoutAttributesForItem, (IMP *)&OriginalLayoutAttributesForItem);
     }
 }
