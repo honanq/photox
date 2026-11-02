@@ -478,10 +478,12 @@ static UIAlertAction *DeleteActionInAlert(UIAlertController *alert) {
         return delete;
     }
     NSString *message = alert.message ?: @"";
-    BOOL mentionsRecentlyDeleted =
-        [message containsString:@"最近删除"] ||
-        [message rangeOfString:@"recently deleted" options:NSCaseInsensitiveSearch].location != NSNotFound;
-    if (choices == 1 && mentionsRecentlyDeleted) {
+    NSString *lowercaseMessage = [message lowercaseString];
+    BOOL mentionsPhoto = [message containsString:@"照片"] ||
+                         [lowercaseMessage containsString:@"photo"];
+    BOOL mentionsDelete = [message containsString:@"删除"] ||
+                          [lowercaseMessage containsString:@"delete"];
+    if (choices == 1 && mentionsPhoto && mentionsDelete) {
         return delete;
     }
     return nil;
