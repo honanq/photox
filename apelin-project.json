@@ -193,5 +193,7 @@
         "com.apple.mobileslideshow"
       ]
     }
-  }
+  },
+  "displayName": "相册增强",
+  "autoName": false
 }
