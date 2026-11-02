@@ -193,11 +193,9 @@ static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section) {
 }
 
 static NSInteger (*OriginalGadgetNumberOfItems)(id, SEL, UICollectionView *, NSInteger);
-static void WriteAlbumInventoryIfNeeded(void);
 
 static NSInteger HookedGadgetNumberOfItems(id self, SEL _cmd, UICollectionView *collectionView,
                                            NSInteger section) {
-    WriteAlbumInventoryIfNeeded();  // main thread, once per launch
     if (gHidePeopleAndPlaces && SectionIsPeopleAndPlaces(self, section)) {
         return 0;
     }
@@ -218,49 +216,39 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
 #pragma mark - Albums the pane lists, and albums it hides
 
 // The pane runs in Settings, which cannot read the photo library, so the album
-// list is exported here, from inside Photos, as a plist it can read. PhotoKit is
-// only called on the main thread, when the Albums tab asks for its sections.
-static BOOL gInventoryWritten = NO;
-
+// list is gathered from the album cards Photos itself builds and published to
+// the preferences domain the pane reads.
 @interface PUAlbumGadget : NSObject
 - (PHAssetCollection *)collection;
 @end
 
-static void WriteAlbumInventoryIfNeeded(void) {
-    if (gInventoryWritten) {
-        return;
-    }
-    gInventoryWritten = YES;
+static void RecordAlbumFromGadget(id gadget) {
+    static NSMutableArray<NSDictionary *> *albums;
+    static NSMutableSet<NSString *> *seen;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        albums = [NSMutableArray array];
+        seen = [NSMutableSet set];
+    });
+    PHAssetCollection *collection = nil;
     @try {
-        NSMutableArray<NSDictionary *> *albums = [NSMutableArray array];
-        NSArray<NSNumber *> *types = @[@(PHAssetCollectionTypeAlbum),
-                                       @(PHAssetCollectionTypeSmartAlbum)];
-        for (NSNumber *type in types) {
-            PHFetchResult<PHAssetCollection *> *result =
-                [PHAssetCollection fetchAssetCollectionsWithType:(PHAssetCollectionType)type.integerValue
-                                                        subtype:PHAssetCollectionSubtypeAny
-                                                        options:nil];
-            for (PHAssetCollection *collection in result) {
-                NSString *title = collection.localizedTitle;
-                if (title.length == 0 || collection.localIdentifier.length == 0) {
-                    continue;
-                }
-                if (IsHiddenSmartAlbum(collection)) {
-                    continue;  // the Hidden album has its own switch
-                }
-                [albums addObject:@{@"id": collection.localIdentifier,
-                                    @"title": title,
-                                    @"smart": @(type.integerValue == PHAssetCollectionTypeSmartAlbum)}];
-            }
+        if ([gadget respondsToSelector:@selector(collection)]) {
+            collection = [(PUAlbumGadget *)gadget collection];
         }
-        // The pane reads the same preferences domain, so the list travels there.
-        CFPreferencesSetAppValue(CFSTR("albumInventory"),
-                                 (__bridge CFPropertyListRef)albums,
-                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID);
-        CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
     } @catch (NSException *exception) {
         (void)exception;
     }
+    NSString *identifier = collection.localIdentifier;
+    NSString *title = collection.localizedTitle;
+    if (identifier.length == 0 || title.length == 0 || [seen containsObject:identifier]) {
+        return;
+    }
+    [seen addObject:identifier];
+    [albums addObject:@{@"id": identifier, @"title": title}];
+    CFPreferencesSetAppValue(CFSTR("albumInventory"),
+                             (__bridge CFPropertyListRef)[albums copy],
+                             (__bridge CFStringRef)@APELIN_PACKAGE_ID);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
 }
 
 // The "我的相簿" list is a horizontal list of PUAlbumGadget, one per album, fed by
@@ -276,6 +264,7 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     }
     NSMutableArray *kept = [NSMutableArray arrayWithCapacity:gadgets.count];
     for (id gadget in gadgets) {
+        RecordAlbumFromGadget(gadget);
         PHAssetCollection *collection = nil;
         @try {
             if ([gadget respondsToSelector:@selector(collection)]) {
