@@ -286,12 +286,13 @@ static BOOL DataSourceIsHiddenAlbum(id dataSource) {
     return hidden;
 }
 
-#pragma mark - Face ID and the cover over the album
+#pragma mark - Face ID, then the empty state
 
 // Photos no longer asks for Face ID for an album it reads as empty, so this
-// asks, and covers the album in plain background colour until it is passed.
+// asks, and the album shows nothing until it is passed: the section stays with
+// no items before, and reads as empty afterwards, which is what makes Photos
+// draw "无照片或视频".
 static char kAskedFaceIDKey;
-static __weak UIView *gCoverView = nil;
 static BOOL gAuthenticated = NO;
 
 static UIViewController *TopViewController(void) {
@@ -323,34 +324,33 @@ static UIViewController *TopViewController(void) {
     return controller;
 }
 
-static void ShowCover(void) {
+// The counts changed, so the grid has to be asked for them again.
+static void RefreshAlbumViews(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (gCoverView != nil) {
-            return;
-        }
         UIViewController *controller = TopViewController();
-        UIView *host = controller.view;
-        if (host == nil) {
+        UIView *root = controller.view;
+        if (root == nil) {
             return;
         }
-        UIView *cover = [[UIView alloc] initWithFrame:host.bounds];
-        cover.backgroundColor = [UIColor systemBackgroundColor];
-        cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        cover.userInteractionEnabled = YES;
-        [host addSubview:cover];
-        gCoverView = cover;
-        FileLog(@"cover shown over %@", NSStringFromClass([controller class]));
-    });
-}
-
-static void HideCover(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gCoverView == nil) {
-            return;
+        NSMutableArray<UIView *> *pending = [NSMutableArray arrayWithObject:root];
+        NSInteger visited = 0;
+        while (pending.count > 0 && visited < 400) {
+            UIView *view = pending.lastObject;
+            [pending removeLastObject];
+            visited++;
+            NSString *name = NSStringFromClass([view class]);
+            if ([name containsString:@"PXG"] || [view isKindOfClass:[UICollectionView class]]) {
+                FileLog(@"relayout %@", name);
+                if ([view isKindOfClass:[UICollectionView class]]) {
+                    [(UICollectionView *)view reloadData];
+                }
+                [view setNeedsLayout];
+                [view layoutIfNeeded];
+            }
+            [pending addObjectsFromArray:view.subviews];
         }
-        [gCoverView removeFromSuperview];
-        gCoverView = nil;
-        FileLog(@"cover removed");
+        [root setNeedsLayout];
+        [root layoutIfNeeded];
     });
 }
 
@@ -360,7 +360,6 @@ static void RequestFaceIDForHiddenAlbum(id dataSource) {
     if (dataSource != lastDataSource) {
         lastDataSource = dataSource;
         gAuthenticated = NO;
-        ShowCover();
     }
     if (gAuthenticated) {
         return;
@@ -382,10 +381,10 @@ static void RequestFaceIDForHiddenAlbum(id dataSource) {
                           reply:^(BOOL success, NSError *authError) {
             FileLog(@"faceid success=%d error=%@", success ? 1 : 0, authError.localizedDescription);
             if (!success) {
-                return;  // The cover stays: blank until the album is opened again.
+                return;  // Still nothing shown; opening the album again asks again.
             }
             gAuthenticated = YES;
-            HideCover();
+            RefreshAlbumViews();
         }];
     });
 }
@@ -398,7 +397,7 @@ static long HookedNumberOfItemsInSection(id self, SEL _cmd, long section) {
                         : 0;
     if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
         RequestFaceIDForHiddenAlbum(self);
-        return 0;
+        return 0;  // No items before Face ID: the page stays blank.
     }
     return original;
 }
@@ -409,7 +408,12 @@ static long HookedNumberOfSections(id self, SEL _cmd) {
     long original = OriginalNumberOfSections != NULL ? OriginalNumberOfSections(self, _cmd) : 0;
     if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
         RequestFaceIDForHiddenAlbum(self);
-        return 0;
+        static NSInteger logged = 0;
+        if (logged < 10) {
+            logged++;
+            FileLog(@"sections orig=%ld authenticated=%d", original, gAuthenticated ? 1 : 0);
+        }
+        return gAuthenticated ? 0 : original;
     }
     return original;
 }
