@@ -1,72 +1,59 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 OwnGoal Studio
 //
-// Hides the contents of the Photos app's "Hidden" smart album: the album reads
-// as empty, so Photos draws its own "无照片或视频" state. The switch lives in the
-// HiddenAlbumSettings preference bundle, stored in the com.simon.hidden-album
-// preferences domain.
-//
-// The album grid does not render +[PHAsset fetchAssetsInAssetCollection:options:];
-// Photos asks its PhotosUI data source for counts, and a PXPhotosDataSource
-// whose containerCollection is the "Hidden" smart album (type 2, subtype 205)
-// answers the grid. That one answer is all this tweak changes.
+// Photos, trimmed down: the "Hidden" smart album reads as empty (Photos draws
+// its own "无照片或视频"), and the "人物与地点" block of the Albums tab can be
+// hidden along with its title. Both are switches in the HiddenAlbumSettings
+// preference bundle, stored in the com.simon.hidden-album domain.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
 #import <objc/runtime.h>
 #import <os/log.h>
-#import <stdlib.h>
 #import <substrate.h>
 
-#pragma mark - The setting
+#pragma mark - The settings
 
-// Read once; re-read only when the pane says it changed or the app comes back to
-// the front. Nothing polls.
-static BOOL gEnabled = YES;
+// Read once per launch; re-read only when the pane says a value changed or the
+// app comes back to the front. Nothing polls.
+static BOOL gHideHiddenAlbum = YES;
+static BOOL gHidePeopleAndPlaces = YES;
 static BOOL gLoaded = NO;
 
-static BOOL ReadEnabledFromPreferences(void) {
+static BOOL BoolFromPreferences(NSString *key, BOOL fallback) {
     NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
-    id value = [defaults objectForKey:@"enabled"];
+    id value = [defaults objectForKey:key];
     if (value != nil && [value respondsToSelector:@selector(boolValue)]) {
         return [value boolValue];
     }
-    return YES;  // No stored value yet: on by default, as Root.plist's default.
+    return fallback;
 }
 
-static BOOL HiddenContentsEnabled(void) {
-    if (!gLoaded) {
-        gEnabled = ReadEnabledFromPreferences();
-        gLoaded = YES;
+static void ReadSettings(void) {
+    BOOL album = BoolFromPreferences(@"enabled", YES);
+    BOOL peopleAndPlaces = BoolFromPreferences(@"hidePeoplePlaces", YES);
+    if (gLoaded && (album != gHideHiddenAlbum || peopleAndPlaces != gHidePeopleAndPlaces)) {
+        // A changed value ends this process: the next launch of Photos starts
+        // from it, with no data source carrying the old one.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            exit(0);
+        });
     }
-    return gEnabled;
-}
-
-// A changed value ends this process, so the next launch of Photos starts from
-// the new value with no data source carrying the old one.
-static void ApplySettingFromPreferences(void) {
-    BOOL enabled = ReadEnabledFromPreferences();
-    BOOL changed = gLoaded && enabled != gEnabled;
-    gEnabled = enabled;
+    gHideHiddenAlbum = album;
+    gHidePeopleAndPlaces = peopleAndPlaces;
     gLoaded = YES;
-    if (!changed) {
-        return;
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        exit(0);
-    });
 }
 
 static void SettingChangedCallback(CFNotificationCenterRef center, void *observer,
                                    CFStringRef name, const void *object,
                                    CFDictionaryRef userInfo) {
     (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
-    ApplySettingFromPreferences();
+    ReadSettings();
 }
 
-#pragma mark - The hidden album
+#pragma mark - The Hidden album
 
 static BOOL IsHiddenSmartAlbum(PHAssetCollection *collection) {
     return [collection isKindOfClass:[PHAssetCollection class]] &&
@@ -126,15 +113,66 @@ static BOOL DataSourceIsHiddenAlbum(id dataSource) {
     return hidden;
 }
 
-#pragma mark - The grid
-
 static long (*OriginalNumberOfSections)(id, SEL);
 
 static long HookedNumberOfSections(id self, SEL _cmd) {
-    if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
+    if (gHideHiddenAlbum && DataSourceIsHiddenAlbum(self)) {
         return 0;  // No sections: Photos draws its own "无照片或视频".
     }
     return OriginalNumberOfSections(self, _cmd);
+}
+
+#pragma mark - 人物与地点 in the Albums tab
+
+// The Albums tab is a gadget collection view: PUAlbumsGadgetViewController (a
+// PXGadgetUIViewController) lists gadgets one section each, and the "人物与地点"
+// section is the gadget whose class says People or Places. With no items and no
+// header, the block and its title are both gone.
+@interface PXGadgetUIViewController : UIViewController
+- (id)_gadgetAtIndexPath:(NSIndexPath *)indexPath;
+@end
+
+static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section) {
+    id gadget = nil;
+    @try {
+        gadget = [(PXGadgetUIViewController *)controller
+            _gadgetAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:section]];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (gadget == nil) {
+        return NO;
+    }
+    NSString *name = NSStringFromClass([gadget class]);
+    return [name containsString:@"People"] || [name containsString:@"Place"];
+}
+
+static NSInteger (*OriginalGadgetNumberOfItems)(id, SEL, UICollectionView *, NSInteger);
+
+static NSInteger HookedGadgetNumberOfItems(id self, SEL _cmd, UICollectionView *collectionView,
+                                           NSInteger section) {
+    if (gHidePeopleAndPlaces && SectionIsPeopleAndPlaces(self, section)) {
+        return 0;
+    }
+    return OriginalGadgetNumberOfItems(self, _cmd, collectionView, section);
+}
+
+static CGSize (*OriginalHeaderSize)(id, SEL, UICollectionView *, UICollectionViewLayout *, NSInteger);
+
+static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionView,
+                               UICollectionViewLayout *layout, NSInteger section) {
+    if (gHidePeopleAndPlaces && SectionIsPeopleAndPlaces(self, section)) {
+        return CGSizeMake(0, 0);
+    }
+    return OriginalHeaderSize(self, _cmd, collectionView, layout, section);
+}
+
+#pragma mark - Loading
+
+static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
+    if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
+        MSHookMessageEx(cls, selector, hook, original);
+    }
 }
 
 __attribute__((constructor)) static void TweakInitialize(void) {
@@ -142,6 +180,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     os_log(os_log_create(APELIN_PACKAGE_ID, "tweak"), "ApelinLoaded %{public}s in %{public}s",
            APELIN_BUILD_ID, getprogname());
 
+    ReadSettings();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     SettingChangedCallback,
                                     (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/changed"),
@@ -153,14 +192,15 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                      queue:nil
                 usingBlock:^(NSNotification *note) {
         (void)note;
-        ApplySettingFromPreferences();
+        ReadSettings();
     }];
 
-    Class photosDataSource = objc_getClass("PXPhotosDataSource");
-    if (photosDataSource != Nil) {
-        MSHookMessageEx(photosDataSource,
-                        @selector(numberOfSections),
-                        (IMP)HookedNumberOfSections,
-                        (IMP *)&OriginalNumberOfSections);
-    }
+    HookSelector(objc_getClass("PXPhotosDataSource"), @selector(numberOfSections),
+                 (IMP)HookedNumberOfSections, (IMP *)&OriginalNumberOfSections);
+
+    Class gadgetController = objc_getClass("PXGadgetUIViewController");
+    HookSelector(gadgetController, @selector(collectionView:numberOfItemsInSection:),
+                 (IMP)HookedGadgetNumberOfItems, (IMP *)&OriginalGadgetNumberOfItems);
+    HookSelector(gadgetController, @selector(collectionView:layout:referenceSizeForHeaderInSection:),
+                 (IMP)HookedHeaderSize, (IMP *)&OriginalHeaderSize);
 }
