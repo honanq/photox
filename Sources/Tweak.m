@@ -263,19 +263,54 @@ static void RecordAlbumFromGadget(id gadget) {
 // PUAlbumsGadgetProvider. Leaving a gadget out of that provider's list is what
 // removes the album's card.
 static NSArray *(*OriginalGadgetProviderGadgets)(id, SEL);
+static id (*OriginalGadgetForIndexPath)(id, SEL, NSIndexPath *);
+static char kGadgetIndexMapKey;
 
+// Leaving a hidden album's gadget out of `gadgets` shortens the list, so every
+// later position must be translated back through the indices kept here.
 static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     NSArray *gadgets = OriginalGadgetProviderGadgets(self, _cmd);
     Class albumsProvider = objc_getClass("PUAlbumsGadgetProvider");
     if (albumsProvider == Nil || ![self isKindOfClass:albumsProvider]) {
         return gadgets;
     }
-    // The list is left as it is (its cells are keyed by position); the album is
-    // hidden by giving its card no size, see below.
     for (id gadget in gadgets) {
         RecordAlbumFromGadget(gadget);
     }
-    return gadgets;
+
+    NSMutableArray *kept = [NSMutableArray arrayWithCapacity:gadgets.count];
+    NSMutableArray *map = [NSMutableArray arrayWithCapacity:gadgets.count];
+    for (NSUInteger i = 0; i < gadgets.count; i++) {
+        id gadget = gadgets[i];
+        PHAssetCollection *collection = nil;
+        if ([gadget respondsToSelector:@selector(collection)]) {
+            @try {
+                collection = [(PUAlbumGadget *)gadget collection];
+            } @catch (NSException *exception) {
+                (void)exception;
+            }
+        }
+        if (collection != nil && AlbumIsHidden(collection)) {
+            continue;
+        }
+        [kept addObject:gadget];
+        [map addObject:@(i)];
+    }
+    if (kept.count == gadgets.count) {
+        return gadgets;
+    }
+    objc_setAssociatedObject(self, &kGadgetIndexMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return [kept copy];
+}
+
+static id HookedGadgetForIndexPath(id self, SEL _cmd, NSIndexPath *indexPath) {
+    NSArray *map = objc_getAssociatedObject(self, &kGadgetIndexMapKey);
+    if (map != nil && indexPath.section == 0 && (NSUInteger)indexPath.item < map.count) {
+        NSIndexPath *mapped = [NSIndexPath indexPathForItem:[map[indexPath.item] integerValue]
+                                                  inSection:0];
+        return OriginalGadgetForIndexPath(self, _cmd, mapped);
+    }
+    return OriginalGadgetForIndexPath(self, _cmd, indexPath);
 }
 
 // A hidden album's card cannot be dropped from the list (its neighbours shift)
@@ -501,18 +536,9 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                         (IMP)HookedLayoutAttributesForItem, (IMP *)&OriginalLayoutAttributesForItem);
     }
 
-    Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
-    if (albumListClass != Nil &&
-        class_getInstanceMethod(albumListClass, @selector(initWithAlbumsGadgetProvider:)) != NULL) {
-        MSHookMessageEx(albumListClass, @selector(initWithAlbumsGadgetProvider:),
-                        (IMP)HookedInitWithAlbumsGadgetProvider,
-                        (IMP *)&OriginalInitWithAlbumsGadgetProvider);
-    }
-
-    Class providerClass = objc_getClass("PUAlbumsGadgetProvider");
-    if (providerClass != Nil &&
-        class_getInstanceMethod(providerClass, @selector(_reconfigureGadgets)) != NULL) {
-        MSHookMessageEx(providerClass, @selector(_reconfigureGadgets),
-                        (IMP)HookedReconfigureGadgets, (IMP *)&OriginalReconfigureGadgets);
+    if (albumsProvider != Nil &&
+        class_getInstanceMethod(albumsProvider, @selector(gadgetForIndexPath:)) != NULL) {
+        MSHookMessageEx(albumsProvider, @selector(gadgetForIndexPath:),
+                        (IMP)HookedGadgetForIndexPath, (IMP *)&OriginalGadgetForIndexPath);
     }
 }
