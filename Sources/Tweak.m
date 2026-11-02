@@ -292,9 +292,8 @@ static BOOL DataSourceIsHiddenAlbum(id dataSource) {
 // asks, and the album shows nothing until it is passed: the section stays with
 // no items before, and reads as empty afterwards, which is what makes Photos
 // draw "无照片或视频".
-static char kAskedFaceIDKey;
+static char kAskedFaceIDKey __attribute__((unused));
 static BOOL gAuthenticated = NO;
-
 static UIViewController *TopViewController(void) {
     UIWindow *keyWindow = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -354,6 +353,32 @@ static void RefreshAlbumViews(void) {
     });
 }
 
+// Photos asks for Face ID itself when the album is opened; asking a second
+// time here only got our own request cancelled by Photos' one. So watch the
+// result of Photos' own request instead: the album stays blank until it passes.
+typedef void (^HiddenAlbumAuthReply)(BOOL success, NSError *error);
+static void (*OriginalEvaluatePolicy)(id, SEL, LAPolicy, NSString *, HiddenAlbumAuthReply);
+
+static void HookedEvaluatePolicy(id self, SEL _cmd, LAPolicy policy, NSString *reason,
+                                 HiddenAlbumAuthReply reply) {
+    FileLog(@"lauth policy=%ld reason=%@", (long)policy, reason);
+    HiddenAlbumAuthReply wrapped = ^(BOOL success, NSError *error) {
+        FileLog(@"lauth done success=%d error=%@", success ? 1 : 0, error.localizedDescription);
+        if (success) {
+            gAuthenticated = YES;
+            RefreshAlbumViews();
+        }
+        if (reply != nil) {
+            reply(success, error);
+        }
+    };
+    if (OriginalEvaluatePolicy != NULL) {
+        OriginalEvaluatePolicy(self, _cmd, policy, reason, wrapped);
+    } else if (reply != nil) {
+        reply(NO, nil);
+    }
+}
+
 static void RequestFaceIDForHiddenAlbum(id dataSource) {
     // A different data source means the album was opened again: ask again.
     static __unsafe_unretained id lastDataSource = nil;
@@ -361,32 +386,6 @@ static void RequestFaceIDForHiddenAlbum(id dataSource) {
         lastDataSource = dataSource;
         gAuthenticated = NO;
     }
-    if (gAuthenticated) {
-        return;
-    }
-    if (objc_getAssociatedObject(dataSource, &kAskedFaceIDKey) != nil) {
-        return;
-    }
-    objc_setAssociatedObject(dataSource, &kAskedFaceIDKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        LAContext *context = [[LAContext alloc] init];
-        NSError *error = nil;
-        if (![context canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
-                                  error:&error]) {
-            FileLog(@"faceid unavailable: %@", error.localizedDescription);
-            return;
-        }
-        [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
-                localizedReason:@"查看「已隐藏」相簿"
-                          reply:^(BOOL success, NSError *authError) {
-            FileLog(@"faceid success=%d error=%@", success ? 1 : 0, authError.localizedDescription);
-            if (!success) {
-                return;  // Still nothing shown; opening the album again asks again.
-            }
-            gAuthenticated = YES;
-            RefreshAlbumViews();
-        }];
-    });
 }
 
 static long (*OriginalNumberOfItemsInSection)(id, SEL, long);
@@ -432,6 +431,16 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                         @selector(fetchAssetsInAssetCollection:options:),
                         (IMP)HookedFetchAssetsInAssetCollection,
                         (IMP *)&OriginalFetchAssetsInAssetCollection);
+    }
+
+    Class laContext = objc_getClass("LAContext");
+    if (laContext != Nil &&
+        class_getInstanceMethod(laContext, @selector(evaluatePolicy:localizedReason:reply:)) != NULL) {
+        MSHookMessageEx(laContext,
+                        @selector(evaluatePolicy:localizedReason:reply:),
+                        (IMP)HookedEvaluatePolicy,
+                        (IMP *)&OriginalEvaluatePolicy);
+        FileLog(@"hooked -[LAContext evaluatePolicy:localizedReason:reply:]");
     }
 
     Class photosDataSource = objc_getClass("PXPhotosDataSource");
