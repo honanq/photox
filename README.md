@@ -16,6 +16,8 @@
    等智能相簿），勾选后该卡片从相簿页消失，后面的卡片自动补位。
 4. **删除时不再询问**（默认关闭）：开启后，查看照片时点删除按钮直接删除，不再弹
    「从相簿中移除 / 删除 / 取消」。删除的照片仍在「最近删除」里，可照常恢复。
+5. **播放视频时自动开启声音**（默认关闭）：开启后，视频一开始播放就取消静音；
+   播放中仍可手动静音，再次播放会重新打开声音。
 
 开关改动后照片 App 会自动重启一次以生效；相簿清单需要先打开一次照片的「相簿」页才会刷新。
 
@@ -31,6 +33,7 @@
 | `-[PUAlbumsGadgetProvider gadgets]` | 读取相簿清单，写入设置页读取的偏好域 |
 | `-[PUDoubleHeightHorizontalAlbumListGadgetLayout layoutAttributesForItemAtIndexPath:]` | 隐藏指定相簿的卡片，并按可见序号重排 |
 | `-[PUOneUpViewController presentViewController:animated:completion:]` | 「删除时不再询问」：命中照片查看器的删除确认弹窗（先「从相簿中移除 / 删除」，再「删除照片」）时，直接执行其中的「删除」动作而不弹出 |
+| `-[PUBrowsingVideoPlayer setDesiredPlayState:]` | 「播放视频时自动开启声音」：播放开始时取消静音（`setMuted:NO`），播放中仍可手动静音 |
 
 相簿可见性只扫描一次并缓存在 provider 上（设置变更或相簿数量变化才重建），
 布局回调只做数组查表；没有轮询、没有定时刷新、没有日志输出。

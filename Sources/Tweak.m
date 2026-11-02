@@ -32,6 +32,7 @@
 static BOOL gHideHiddenAlbum = YES;
 static BOOL gHidePeopleAndPlaces = YES;
 static BOOL gQuickDelete = NO;
+static BOOL gAutoUnmuteVideo = NO;
 static BOOL gLoaded = NO;
 static int gSettingsGeneration = 0;
 static NSDictionary<NSString *, NSNumber *> *gHiddenAlbumFlags = nil;
@@ -83,6 +84,7 @@ static void ReadSettings(void) {
     gHideHiddenAlbum = album;
     gHidePeopleAndPlaces = peopleAndPlaces;
     gQuickDelete = BoolFromPreferences(@"quickDelete", NO);
+    gAutoUnmuteVideo = BoolFromPreferences(@"autoUnmuteVideo", NO);
     gHiddenAlbumFlags = nil;  // per-album switches are re-read on next use
     gSettingsGeneration++;    // and every cached album list with them
     gLoaded = YES;
@@ -515,6 +517,40 @@ static void HookedPresentViewController(id self, SEL _cmd, UIViewController *vie
     OriginalPresentViewController(self, _cmd, viewController, animated, completion);
 }
 
+#pragma mark - Sound when a video plays
+
+// PUBrowsingVideoPlayer is the viewer's video model: play/pause reaches it as
+// -setDesiredPlayState:, and muting as -setMuted:. Playing always starts with the
+// sound on when the pane asks for it; muting while playing still works, and
+// playing again turns the sound back on.
+@interface PUBrowsingVideoPlayer : NSObject
+- (void)setMuted:(BOOL)muted;
+- (void)setDesiredPlayState:(long long)state;
+@end
+
+static void (*OriginalSetDesiredPlayState)(id, SEL, long long);
+
+static void HookedSetDesiredPlayState(id self, SEL _cmd, long long state) {
+    OriginalSetDesiredPlayState(self, _cmd, state);
+    if (!gAutoUnmuteVideo) {
+        return;
+    }
+    BOOL wanted = NO;
+    @try {
+        wanted = [[(PUBrowsingVideoPlayer *)self valueForKey:@"isPlaybackDesired"] boolValue];
+    } @catch (NSException *exception) {
+        (void)exception;
+        return;
+    }
+    if (wanted) {
+        @try {
+            [(PUBrowsingVideoPlayer *)self setMuted:NO];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+    }
+}
+
 #pragma mark - Hooks
 
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
@@ -562,4 +598,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     HookSelector(objc_getClass("PUOneUpViewController"),
                  @selector(presentViewController:animated:completion:),
                  (IMP)HookedPresentViewController, (IMP *)&OriginalPresentViewController);
+
+    HookSelector(objc_getClass("PUBrowsingVideoPlayer"), @selector(setDesiredPlayState:),
+                 (IMP)HookedSetDesiredPlayState, (IMP *)&OriginalSetDesiredPlayState);
 }
