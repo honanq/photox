@@ -13,6 +13,8 @@
 #import <os/log.h>
 #import <substrate.h>
 
+#import "ApelinBootstrap.h"
+
 #pragma mark - The settings
 
 // Read once per launch; re-read only when the pane says a value changed or the
@@ -20,6 +22,7 @@
 static BOOL gHideHiddenAlbum = YES;
 static BOOL gHidePeopleAndPlaces = YES;
 static BOOL gLoaded = NO;
+static NSDictionary<NSString *, NSNumber *> *gHiddenAlbumFlags = nil;
 
 static NSUserDefaults *Preferences(void) {
     return [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
@@ -31,6 +34,27 @@ static BOOL BoolFromPreferences(NSString *key, BOOL fallback) {
         return [value boolValue];
     }
     return fallback;
+}
+
+// True when the pane has this album's own switch on. The pane stores one key
+// per album, "hide.<localIdentifier>".
+static BOOL AlbumIsHidden(PHAssetCollection *collection) {
+    if (![collection isKindOfClass:[PHAssetCollection class]] ||
+        collection.localIdentifier.length == 0) {
+        return NO;
+    }
+    if (gHiddenAlbumFlags == nil) {
+        NSDictionary *all = [Preferences() dictionaryRepresentation];
+        NSMutableDictionary *flags = [NSMutableDictionary dictionary];
+        for (NSString *key in all) {
+            if ([key hasPrefix:@"hide."]) {
+                flags[[key substringFromIndex:5]] = all[key];
+            }
+        }
+        gHiddenAlbumFlags = flags;
+    }
+    NSNumber *flag = gHiddenAlbumFlags[collection.localIdentifier];
+    return flag != nil && flag.boolValue;
 }
 
 static void ReadSettings(void) {
@@ -46,6 +70,7 @@ static void ReadSettings(void) {
     }
     gHideHiddenAlbum = album;
     gHidePeopleAndPlaces = peopleAndPlaces;
+    gHiddenAlbumFlags = nil;  // per-album switches are re-read on next use
     gLoaded = YES;
 }
 
@@ -168,9 +193,11 @@ static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section) {
 }
 
 static NSInteger (*OriginalGadgetNumberOfItems)(id, SEL, UICollectionView *, NSInteger);
+static void WriteAlbumInventoryIfNeeded(void);
 
 static NSInteger HookedGadgetNumberOfItems(id self, SEL _cmd, UICollectionView *collectionView,
                                            NSInteger section) {
+    WriteAlbumInventoryIfNeeded();  // main thread, once per launch
     if (gHidePeopleAndPlaces && SectionIsPeopleAndPlaces(self, section)) {
         return 0;
     }
@@ -187,6 +214,83 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
     return OriginalHeaderSize(self, _cmd, collectionView, layout, section);
 }
 
+
+#pragma mark - Albums the pane lists, and albums it hides
+
+// The pane runs in Settings, which cannot read the photo library, so the album
+// list is exported here, from inside Photos, as a plist it can read. PhotoKit is
+// only called on the main thread, when the Albums tab asks for its sections.
+static BOOL gInventoryWritten = NO;
+
+@interface PUAlbumGadget : NSObject
+- (PHAssetCollection *)collection;
+@end
+
+static void WriteAlbumInventoryIfNeeded(void) {
+    if (gInventoryWritten) {
+        return;
+    }
+    gInventoryWritten = YES;
+    @try {
+        NSMutableArray<NSDictionary *> *albums = [NSMutableArray array];
+        NSArray<NSNumber *> *types = @[@(PHAssetCollectionTypeAlbum),
+                                       @(PHAssetCollectionTypeSmartAlbum)];
+        for (NSNumber *type in types) {
+            PHFetchResult<PHAssetCollection *> *result =
+                [PHAssetCollection fetchAssetCollectionsWithType:(PHAssetCollectionType)type.integerValue
+                                                        subtype:PHAssetCollectionSubtypeAny
+                                                        options:nil];
+            for (PHAssetCollection *collection in result) {
+                NSString *title = collection.localizedTitle;
+                if (title.length == 0 || collection.localIdentifier.length == 0) {
+                    continue;
+                }
+                if (IsHiddenSmartAlbum(collection)) {
+                    continue;  // the Hidden album has its own switch
+                }
+                [albums addObject:@{@"id": collection.localIdentifier,
+                                    @"title": title,
+                                    @"smart": @(type.integerValue == PHAssetCollectionTypeSmartAlbum)}];
+            }
+        }
+        // The pane reads the same preferences domain, so the list travels there.
+        CFPreferencesSetAppValue(CFSTR("albumInventory"),
+                                 (__bridge CFPropertyListRef)albums,
+                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID);
+        CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+}
+
+// The "我的相簿" list is a horizontal list of PUAlbumGadget, one per album, fed by
+// PUAlbumsGadgetProvider. Leaving a gadget out of that provider's list is what
+// removes the album's card.
+static NSArray *(*OriginalGadgetProviderGadgets)(id, SEL);
+
+static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
+    NSArray *gadgets = OriginalGadgetProviderGadgets(self, _cmd);
+    Class albumsProvider = objc_getClass("PUAlbumsGadgetProvider");
+    if (albumsProvider == Nil || ![self isKindOfClass:albumsProvider]) {
+        return gadgets;
+    }
+    NSMutableArray *kept = [NSMutableArray arrayWithCapacity:gadgets.count];
+    for (id gadget in gadgets) {
+        PHAssetCollection *collection = nil;
+        @try {
+            if ([gadget respondsToSelector:@selector(collection)]) {
+                collection = [(PUAlbumGadget *)gadget collection];
+            }
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        if (collection != nil && AlbumIsHidden(collection)) {
+            continue;
+        }
+        [kept addObject:gadget];
+    }
+    return kept;
+}
 
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
     if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
@@ -222,4 +326,16 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                  (IMP)HookedGadgetNumberOfItems, (IMP *)&OriginalGadgetNumberOfItems);
     HookSelector(gadgetController, @selector(collectionView:layout:referenceSizeForHeaderInSection:),
                  (IMP)HookedHeaderSize, (IMP *)&OriginalHeaderSize);
+
+    Class albumsProvider = objc_getClass("PUAlbumsGadgetProvider");
+    if (albumsProvider != Nil && class_getInstanceMethod(albumsProvider, @selector(gadgets)) != NULL) {
+        MSHookMessageEx(albumsProvider, @selector(gadgets),
+                        (IMP)HookedGadgetProviderGadgets, (IMP *)&OriginalGadgetProviderGadgets);
+    } else {
+        Class baseProvider = objc_getClass("PXGadgetProvider");
+        if (baseProvider != Nil && class_getInstanceMethod(baseProvider, @selector(gadgets)) != NULL) {
+            MSHookMessageEx(baseProvider, @selector(gadgets),
+                            (IMP)HookedGadgetProviderGadgets, (IMP *)&OriginalGadgetProviderGadgets);
+        }
+    }
 }

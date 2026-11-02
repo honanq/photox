@@ -7,8 +7,6 @@
 // tweak reads to leave that album out of the Albums page.
 #import <Preferences/PSListController.h>
 
-#import "ApelinBootstrap.h"
-
 @interface HiddenAlbumSettingsRootListController : PSListController
 @end
 
@@ -30,13 +28,11 @@
 }
 
 - (void)addAlbumSwitchesTo:(NSMutableArray *)specifiers {
-    NSString *path = ApelinBootstrapPath(@"/var/mobile/Library/HiddenAlbumAlbums.plist");
-    NSArray<NSDictionary *> *albums = path != nil
-        ? [NSArray arrayWithContentsOfFile:path]
-        : nil;
-    if (albums.count == 0) {
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
+    NSArray<NSDictionary *> *albums = [defaults objectForKey:@"albumInventory"];
+    if (![albums isKindOfClass:[NSArray class]] || albums.count == 0) {
         PSSpecifier *group = [PSSpecifier groupSpecifierWithName:@"相簿"];
-        [group setProperty:@"打开一次照片 App 的「相簿」页后，这里会列出你的相簿。"
+        [group setProperty:@"先打开一次照片 App 的「相簿」页，再回到这里，就会列出你的相簿。"
                    forKey:@"footerText"];
         [specifiers addObject:group];
         return;
