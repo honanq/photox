@@ -262,18 +262,6 @@ static void RecordAlbumFromGadget(id gadget) {
 // The "我的相簿" list is a horizontal list of PUAlbumGadget, one per album, fed by
 // PUAlbumsGadgetProvider. Leaving a gadget out of that provider's list is what
 // removes the album's card.
-// A gadget is created per album, and the horizontal list keys its cells by
-// position, so a hidden album must never become a gadget at all: dropping it
-// from the finished array shifted every card after it.
-static id (*OriginalNewGadgetForCollection)(id, SEL, PHAssetCollection *);
-
-static id HookedNewGadgetForCollection(id self, SEL _cmd, PHAssetCollection *collection) {
-    if (AlbumIsHidden(collection)) {
-        return nil;
-    }
-    return OriginalNewGadgetForCollection(self, _cmd, collection);
-}
-
 static NSArray *(*OriginalGadgetProviderGadgets)(id, SEL);
 
 static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
@@ -350,8 +338,6 @@ __attribute__((constructor)) static void TweakInitialize(void) {
 
     if (albumsProvider != Nil &&
         class_getInstanceMethod(albumsProvider, @selector(_newGadgetForCollection:)) != NULL) {
-        MSHookMessageEx(albumsProvider, @selector(_newGadgetForCollection:),
-                        (IMP)HookedNewGadgetForCollection,
-                        (IMP *)&OriginalNewGadgetForCollection);
+        // Kept unhooked: returning nil from this creation point terminates Photos.
     }
 }
