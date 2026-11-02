@@ -487,26 +487,12 @@ static UIAlertAction *DeleteActionInAlert(UIAlertController *alert) {
     return nil;
 }
 
-// Only Photos asks this, so the presenter has to belong to Photos: the tweak is
-// injected into that one app, and the class check keeps other frameworks' alerts
-// (share sheets and the like) untouched.
-static BOOL PresenterIsPhotos(id presenter) {
-    if (presenter == nil) {
-        return NO;
-    }
-    NSString *bundle = [NSBundle bundleForClass:[presenter class]].bundleIdentifier;
-    if ([bundle isEqualToString:@"com.apple.mobileslideshow"] ||
-        [bundle hasPrefix:@"com.apple.Photos"]) {
-        return YES;
-    }
-    NSString *name = NSStringFromClass([presenter class]);
-    return [name hasPrefix:@"PU"] || [name hasPrefix:@"PX"] || [name containsString:@"Photo"];
-}
-
+// Only this app's own alerts are considered: the tweak is injected into Photos
+// alone, and the two shapes matched by DeleteActionInAlert are specific enough
+// that another alert in this app cannot be mistaken for them.
 static void HookedPresentViewController(id self, SEL _cmd, UIViewController *viewController,
                                         BOOL animated, void (^completion)(void)) {
-    if (gQuickDelete && [viewController isKindOfClass:[UIAlertController class]] &&
-        PresenterIsPhotos(self)) {
+    if (gQuickDelete && [viewController isKindOfClass:[UIAlertController class]]) {
         UIAlertAction *delete = DeleteActionInAlert((UIAlertController *)viewController);
         if (delete != nil) {
             void (^handler)(UIAlertAction *) = nil;
@@ -525,6 +511,38 @@ static void HookedPresentViewController(id self, SEL _cmd, UIViewController *vie
         }
     }
     OriginalPresentViewController(self, _cmd, viewController, animated, completion);
+}
+
+// Some of Photos' alerts do not come through presentViewController: on this build
+// the system delete confirmation is shown by its own presenter. One that appears
+// all the same is closed here and its 删除 action run instead.
+static void (*OriginalAlertViewDidAppear)(id, SEL, BOOL);
+
+static void HookedAlertViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    OriginalAlertViewDidAppear(self, _cmd, animated);
+    if (!gQuickDelete) {
+        return;
+    }
+    UIAlertAction *delete = DeleteActionInAlert((UIAlertController *)self);
+    if (delete == nil) {
+        return;
+    }
+    void (^handler)(UIAlertAction *) = nil;
+    @try {
+        handler = [delete valueForKey:@"handler"];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (handler == nil) {
+        return;
+    }
+    UIAlertController *alert = (UIAlertController *)self;
+    [alert dismissViewControllerAnimated:NO
+                              completion:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            handler(delete);
+        });
+    }];
 }
 
 #pragma mark - Hooks
@@ -574,4 +592,6 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     HookSelector(objc_getClass("UIViewController"),
                  @selector(presentViewController:animated:completion:),
                  (IMP)HookedPresentViewController, (IMP *)&OriginalPresentViewController);
+    HookSelector(objc_getClass("UIAlertController"), @selector(viewDidAppear:),
+                 (IMP)HookedAlertViewDidAppear, (IMP *)&OriginalAlertViewDidAppear);
 }
