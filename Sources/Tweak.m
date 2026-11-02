@@ -6,13 +6,15 @@
 // title, and single albums can be left out of "我的相簿". Every switch belongs to
 // the HiddenAlbumSettings pane and lives in the com.simon.hidden-album domain.
 //
-// Five hooks, each on the class that implements the method:
+// Six hooks, each on the class that implements the method:
 //   -[PXPhotosDataSource numberOfSections]                    the Hidden album
 //   -[PXGadgetUIViewController collectionView:numberOfItemsInSection:]      \
 //   -[PXGadgetUIViewController collectionView:layout:referenceSize...:]      / 人物与地点
 //   -[PUAlbumsGadgetProvider gadgets]                          the album list
 //   -[PUDoubleHeightHorizontalAlbumListGadgetLayout layoutAttributesForItemAtIndexPath:]
 //                                                              hidden album cards
+//   -[PUOneUpViewController presentViewController:animated:completion:]
+//                                                              deleting without asking
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -436,9 +438,10 @@ static UICollectionViewLayoutAttributes *HookedAlbumLayoutItem(id self, SEL _cmd
 
 #pragma mark - Deleting a photo without the question
 
-// The viewer's trash button shows an action sheet: 从相簿中移除 / 删除 / 取消. With
-// the switch on the sheet is not presented at all and its 删除 action runs
-// straight away; the photo still lands in 最近删除, as any delete does.
+// The viewer's trash button shows an action sheet: 从相簿中移除 / 删除 / 取消, and
+// choosing 删除 brings a second confirmation. With the switch on neither is
+// presented: the 删除 action of the one that Photos asks for is run instead, so
+// the photo is deleted straight away and still lands in 最近删除.
 static BOOL (*OriginalPresentViewController)(id, SEL, UIViewController *, BOOL, void (^)(void));
 
 static BOOL TitleMentionsAlbum(NSString *title) {
@@ -489,21 +492,9 @@ static UIAlertAction *DeleteActionInAlert(UIAlertController *alert) {
     return nil;
 }
 
-// The viewer that asks before deleting: -[PUOneUpViewController ...] presents the
-// confirmation, which is how this tweak tells it apart from any other alert.
-static BOOL PresenterIsOneUp(id presenter) {
-    for (Class cls = [presenter class]; cls != Nil; cls = class_getSuperclass(cls)) {
-        if ([NSStringFromClass(cls) containsString:@"OneUp"]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
 static void HookedPresentViewController(id self, SEL _cmd, UIViewController *viewController,
                                         BOOL animated, void (^completion)(void)) {
-    if (gQuickDelete && [viewController isKindOfClass:[UIAlertController class]] &&
-        PresenterIsOneUp(self)) {
+    if (gQuickDelete && [viewController isKindOfClass:[UIAlertController class]]) {
         UIAlertAction *delete = DeleteActionInAlert((UIAlertController *)viewController);
         if (delete != nil) {
             void (^handler)(UIAlertAction *) = nil;
@@ -522,38 +513,6 @@ static void HookedPresentViewController(id self, SEL _cmd, UIViewController *vie
         }
     }
     OriginalPresentViewController(self, _cmd, viewController, animated, completion);
-}
-
-// Some of Photos' alerts do not come through presentViewController: on this build
-// the system delete confirmation is shown by its own presenter. One that appears
-// all the same is closed here and its 删除 action run instead.
-static void (*OriginalAlertViewDidAppear)(id, SEL, BOOL);
-
-static void HookedAlertViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    OriginalAlertViewDidAppear(self, _cmd, animated);
-    if (!gQuickDelete) {
-        return;
-    }
-    UIAlertAction *delete = DeleteActionInAlert((UIAlertController *)self);
-    if (delete == nil || !PresenterIsOneUp([(UIViewController *)self presentingViewController])) {
-        return;
-    }
-    void (^handler)(UIAlertAction *) = nil;
-    @try {
-        handler = [delete valueForKey:@"handler"];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    if (handler == nil) {
-        return;
-    }
-    UIAlertController *alert = (UIAlertController *)self;
-    [alert dismissViewControllerAnimated:NO
-                              completion:^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            handler(delete);
-        });
-    }];
 }
 
 #pragma mark - Hooks
@@ -600,9 +559,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                  @selector(layoutAttributesForItemAtIndexPath:),
                  (IMP)HookedAlbumLayoutItem, (IMP *)&OriginalAlbumLayoutItem);
 
-    HookSelector(objc_getClass("UIViewController"),
+    HookSelector(objc_getClass("PUOneUpViewController"),
                  @selector(presentViewController:animated:completion:),
                  (IMP)HookedPresentViewController, (IMP *)&OriginalPresentViewController);
-    HookSelector(objc_getClass("UIAlertController"), @selector(viewDidAppear:),
-                 (IMP)HookedAlertViewDidAppear, (IMP *)&OriginalAlertViewDidAppear);
 }

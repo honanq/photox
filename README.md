@@ -30,7 +30,7 @@
 | `-[PXGadgetUIViewController collectionView:layout:referenceSizeForHeaderInSection:]` | 该段标题高度归零 |
 | `-[PUAlbumsGadgetProvider gadgets]` | 读取相簿清单，写入设置页读取的偏好域 |
 | `-[PUDoubleHeightHorizontalAlbumListGadgetLayout layoutAttributesForItemAtIndexPath:]` | 隐藏指定相簿的卡片，并按可见序号重排 |
-| `-[UIViewController presentViewController:animated:completion:]` | 「删除时不再询问」：命中照片查看器的删除确认弹窗时，直接执行其中的「删除」动作而不弹出 |
+| `-[PUOneUpViewController presentViewController:animated:completion:]` | 「删除时不再询问」：命中照片查看器的删除确认弹窗（先「从相簿中移除 / 删除」，再「删除照片」）时，直接执行其中的「删除」动作而不弹出 |
 
 相簿可见性只扫描一次并缓存在 provider 上（设置变更或相簿数量变化才重建），
 布局回调只做数组查表；没有轮询、没有定时刷新、没有日志输出。
