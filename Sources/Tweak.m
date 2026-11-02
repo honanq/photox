@@ -443,6 +443,33 @@ static UICollectionViewLayoutAttributes *HookedLayoutAttributesForItem(id self, 
     if (collection != nil && AlbumIsHidden(collection)) {
         attributes.hidden = YES;
     }
+
+    // A hidden card keeps its place in the data; move everything after it to the
+    // left so its slot closes up instead of showing as a gap.
+    NSUInteger hiddenBefore = 0;
+    for (NSUInteger item = 0; item < (NSUInteger)indexPath.item; item++) {
+        NSIndexPath *earlier = [NSIndexPath indexPathForItem:item inSection:indexPath.section];
+        PHAssetCollection *earlierCollection = AlbumAtIndexPath(dataSource, earlier);
+        if (earlierCollection != nil && AlbumIsHidden(earlierCollection)) {
+            hiddenBefore++;
+        }
+    }
+    if (hiddenBefore > 0) {
+        NSIndexPath *nextPath = [NSIndexPath indexPathForItem:indexPath.item + 1
+                                                  inSection:indexPath.section];
+        UICollectionViewLayoutAttributes *next =
+            OriginalLayoutAttributesForItem(self, _cmd, nextPath);
+        CGFloat step = attributes.frame.size.width;
+        if (next != nil) {
+            CGFloat spacing = next.frame.origin.x - (attributes.frame.origin.x + attributes.frame.size.width);
+            if (spacing > 0 && spacing < step) {
+                step += spacing;
+            }
+        }
+        CGRect frame = attributes.frame;
+        frame.origin.x -= hiddenBefore * step;
+        attributes.frame = frame;
+    }
     return attributes;
 }
 
