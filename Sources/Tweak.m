@@ -277,91 +277,50 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     for (id gadget in gadgets) {
         RecordAlbumFromGadget(gadget);
     }
+    return gadgets;
+}
 
-    {
-        NSString *providerName = NSStringFromClass([self class]);
-        NSString *listType = @"-";
-        @try {
-            id type = [self valueForKey:@"albumListType"];
-            listType = [type description];
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
-        NSMutableArray *identity = [NSMutableArray array];
-        for (id gadget in gadgets) {
-            PHAssetCollection *c = nil;
-            if ([gadget respondsToSelector:@selector(collection)]) {
-                @try {
-                    c = [(PUAlbumGadget *)gadget collection];
-                } @catch (NSException *exception) {
-                    (void)exception;
-                }
-            }
-            [identity addObject:[NSString stringWithFormat:@"%@|%@|%lu|%lu|%@|%@",
-                                 NSStringFromClass([gadget class]),
-                                 c ? @"col" : @"nil",
-                                 (unsigned long)(c ? c.assetCollectionType : 999),
-                                 (unsigned long)(c ? c.assetCollectionSubtype : 999),
-                                 c.localIdentifier ?: @"-",
-                                 (c != nil && AlbumIsHidden(c)) ? @"HIDDEN" : @"-"]];
-        }
-        NSString *entry = [NSString stringWithFormat:@"=== %@ type=%@ n=%lu\n%@",
-                           providerName, listType, (unsigned long)gadgets.count,
-                           [identity componentsJoinedByString:@"\n"]];
-        NSMutableArray *lines = [NSMutableArray array];
-        id existing = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("gadgetDump"),
-                                                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID));
-        if ([existing isKindOfClass:[NSArray class]]) {
-            [lines addObjectsFromArray:existing];
-        }
-        if (![lines containsObject:entry] && lines.count < 40) {
-            [lines addObject:entry];
-        }
-        CFPreferencesSetAppValue(CFSTR("gadgetDump"),
-                                 (__bridge CFPropertyListRef)lines,
-                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID);
-        CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
-    }
+// The album cards are laid out by PXHorizontalCollectionGadget, which keeps its
+// own order: dropping an entry or translating its position moves every card
+// after it. So the list is left exactly as Photos built it and a hidden album's
+// card is simply not drawn.
+static id (*OriginalCellForItemAtIndexPath)(id, SEL, UICollectionView *, NSIndexPath *);
 
-    NSMutableArray *kept = [NSMutableArray arrayWithCapacity:gadgets.count];
-    NSMutableArray *map = [NSMutableArray arrayWithCapacity:gadgets.count];
-    for (NSUInteger i = 0; i < gadgets.count; i++) {
-        id gadget = gadgets[i];
-        PHAssetCollection *collection = nil;
-        if ([gadget respondsToSelector:@selector(collection)]) {
-            @try {
-                collection = [(PUAlbumGadget *)gadget collection];
-            } @catch (NSException *exception) {
-                (void)exception;
-            }
-        }
-        if (collection != nil && AlbumIsHidden(collection)) {
-            continue;
-        }
-        [kept addObject:gadget];
-        [map addObject:@(i)];
+static PHAssetCollection *AlbumAtGadgetIndexPath(id horizontalGadget, NSIndexPath *indexPath);
+
+static UICollectionViewCell *HookedCellForItemAtIndexPath(id self, SEL _cmd,
+                                                          UICollectionView *collectionView,
+                                                          NSIndexPath *indexPath) {
+    UICollectionViewCell *cell = OriginalCellForItemAtIndexPath(self, _cmd, collectionView, indexPath);
+    PHAssetCollection *collection = AlbumAtGadgetIndexPath(self, indexPath);
+    if (collection != nil && AlbumIsHidden(collection)) {
+        cell.hidden = YES;
+    } else if (cell.hidden) {
+        cell.hidden = NO;
     }
-    if (kept.count == gadgets.count) {
-        return gadgets;
+    return cell;
+}
+
+static PHAssetCollection *AlbumAtGadgetIndexPath(id horizontalGadget, NSIndexPath *indexPath) {
+    id provider = nil;
+    @try {
+        provider = [horizontalGadget valueForKey:@"provider"];
+    } @catch (NSException *exception) {
+        (void)exception;
     }
-    {
-        NSMutableArray *lines = [NSMutableArray array];
-        id existing = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("filterLog"),
-                                                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID));
-        if ([existing isKindOfClass:[NSArray class]]) {
-            [lines addObjectsFromArray:existing];
-        }
-        NSString *line = [NSString stringWithFormat:@"%@ %lu -> %lu", NSStringFromClass([self class]),
-                          (unsigned long)gadgets.count, (unsigned long)kept.count];
-        if (![lines containsObject:line] && lines.count < 20) {
-            [lines addObject:line];
-        }
-        CFPreferencesSetAppValue(CFSTR("filterLog"), (__bridge CFPropertyListRef)lines,
-                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID);
-        CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
+    if (provider == nil || ![provider respondsToSelector:@selector(gadgetForIndexPath:)]) {
+        return nil;
     }
-    objc_setAssociatedObject(self, &kGadgetIndexMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return [kept copy];
+    id gadget = nil;
+    @try {
+        gadget = [(id)provider performSelector:@selector(gadgetForIndexPath:) withObject:indexPath];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (gadget != nil && [gadget respondsToSelector:@selector(collection)]) {
+        return [(PUAlbumGadget *)gadget collection];
+    }
+    return nil;
 }
 
 static char kProviderDumpOnceKey;
@@ -401,12 +360,19 @@ static void DumpProviders(id self, NSArray *gadgets) {
 
 static id HookedGadgetForIndexPath(id self, SEL _cmd, NSIndexPath *indexPath) {
     NSArray *map = objc_getAssociatedObject(self, &kGadgetIndexMapKey);
-    if (map != nil && indexPath.section == 0 && (NSUInteger)indexPath.item < map.count) {
-        NSIndexPath *mapped = [NSIndexPath indexPathForItem:[map[indexPath.item] integerValue]
-                                                  inSection:0];
-        return OriginalGadgetForIndexPath(self, _cmd, mapped);
+    if (map == nil) {
+        return OriginalGadgetForIndexPath(self, _cmd, indexPath);
     }
-    return OriginalGadgetForIndexPath(self, _cmd, indexPath);
+    NSIndexPath *mapped = nil;
+    if (indexPath.section == 0) {
+        if ((NSUInteger)indexPath.item < map.count) {
+            mapped = [NSIndexPath indexPathForItem:[map[indexPath.item] integerValue] inSection:0];
+        }
+    } else if ((NSUInteger)indexPath.section < map.count) {
+        mapped = [NSIndexPath indexPathForItem:indexPath.item
+                                     inSection:[map[indexPath.section] integerValue]];
+    }
+    return OriginalGadgetForIndexPath(self, _cmd, mapped ?: indexPath);
 }
 
 // A hidden album's card cannot be dropped from the list (its neighbours shift)
@@ -563,6 +529,31 @@ static void HookedReconfigureGadgets(id self, SEL _cmd) {
     }
 }
 
+static void ProbeCellDataSource(void) {
+    NSMutableArray *lines = [NSMutableArray array];
+    Class horizontal = objc_getClass("PXHorizontalCollectionGadget");
+    if (horizontal != Nil) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(horizontal, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            [lines addObject:NSStringFromSelector(method_getName(methods[i]))];
+        }
+        free(methods);
+        // Ivars say where the gadget list is kept.
+        unsigned int ivarCount = 0;
+        Ivar *ivars = class_copyIvarList(horizontal, &ivarCount);
+        for (unsigned int i = 0; i < ivarCount; i++) {
+            NSString *name = @(ivar_getName(ivars[i]));
+            const char *type = ivar_getTypeEncoding(ivars[i]);
+            [lines addObject:[NSString stringWithFormat:@"ivar:%@:%s", name, type ?: "?"]];
+        }
+        free(ivars);
+    }
+    CFPreferencesSetAppValue(CFSTR("cellProbe"), (__bridge CFPropertyListRef)lines,
+                             (__bridge CFStringRef)@APELIN_PACKAGE_ID);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
+}
+
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
     if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
         MSHookMessageEx(cls, selector, hook, original);
@@ -632,9 +623,13 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                         (IMP)HookedLayoutAttributesForItem, (IMP *)&OriginalLayoutAttributesForItem);
     }
 
-    if (albumsProvider != Nil &&
-        class_getInstanceMethod(albumsProvider, @selector(gadgetForIndexPath:)) != NULL) {
-        // Left unhooked on purpose: the list reads its cells from `gadgets` by
-        // position, so translating the index again would shift every card.
+    Class horizontalGadget = objc_getClass("PXHorizontalCollectionGadget");
+    if (horizontalGadget != Nil &&
+        class_getInstanceMethod(horizontalGadget, @selector(collectionView:cellForItemAtIndexPath:)) != NULL) {
+        MSHookMessageEx(horizontalGadget, @selector(collectionView:cellForItemAtIndexPath:),
+                        (IMP)HookedCellForItemAtIndexPath,
+                        (IMP *)&OriginalCellForItemAtIndexPath);
     }
+
+    ProbeCellDataSource();
 }
