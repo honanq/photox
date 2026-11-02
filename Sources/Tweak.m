@@ -2,9 +2,17 @@
 // Copyright (c) 2026 OwnGoal Studio
 //
 // Photos, trimmed down: the "Hidden" smart album reads as empty (Photos draws
-// its own "无照片或视频"), and the "人物与地点" block of the Albums tab can be
-// hidden along with its title. Both are switches in the HiddenAlbumSettings
-// preference bundle, stored in the com.simon.hidden-album domain.
+// its own "无照片或视频"), the "人物与地点" block of the Albums tab is gone with its
+// title, and single albums can be left out of "我的相簿". Every switch belongs to
+// the HiddenAlbumSettings pane and lives in the com.simon.hidden-album domain.
+//
+// Five hooks, each on the class that implements the method:
+//   -[PXPhotosDataSource numberOfSections]                    the Hidden album
+//   -[PXGadgetUIViewController collectionView:numberOfItemsInSection:]      \
+//   -[PXGadgetUIViewController collectionView:layout:referenceSize...:]      / 人物与地点
+//   -[PUAlbumsGadgetProvider gadgets]                          the album list
+//   -[PUDoubleHeightHorizontalAlbumListGadgetLayout layoutAttributesForItemAtIndexPath:]
+//                                                              hidden album cards
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -17,11 +25,12 @@
 
 #pragma mark - The settings
 
-// Read once per launch; re-read only when the pane says a value changed or the
-// app comes back to the front. Nothing polls.
+// Read once per launch and re-read only when the pane says a value changed or
+// the app comes back to the front. Nothing polls.
 static BOOL gHideHiddenAlbum = YES;
 static BOOL gHidePeopleAndPlaces = YES;
 static BOOL gLoaded = NO;
+static int gSettingsGeneration = 0;
 static NSDictionary<NSString *, NSNumber *> *gHiddenAlbumFlags = nil;
 
 static NSUserDefaults *Preferences(void) {
@@ -71,6 +80,7 @@ static void ReadSettings(void) {
     gHideHiddenAlbum = album;
     gHidePeopleAndPlaces = peopleAndPlaces;
     gHiddenAlbumFlags = nil;  // per-album switches are re-read on next use
+    gSettingsGeneration++;    // and every cached album list with them
     gLoaded = YES;
 }
 
@@ -152,10 +162,10 @@ static long HookedNumberOfSections(id self, SEL _cmd) {
 
 #pragma mark - 人物与地点 in the Albums tab
 
-// The Albums tab is a gadget collection view: PUAlbumsGadgetViewController (a
-// PXGadgetUIViewController) lists gadgets one section each, titled "我的相簿",
-// "人物与地点", "媒体类型" and so on. The section whose gadget is titled People &
-// Places gets no items and no header, so the block and its title are both gone.
+// The Albums tab is a gadget collection view: PXGadgetUIViewController lists
+// gadgets one section each, titled "我的相簿", "人物与地点", "媒体类型" and so on.
+// The section whose gadget is People & Places gets no items and no header, so the
+// block and its title are both gone.
 @interface PXGadgetUIViewController : UIViewController
 - (id)_gadgetAtIndexPath:(NSIndexPath *)indexPath;
 @end
@@ -212,8 +222,7 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
     return OriginalHeaderSize(self, _cmd, collectionView, layout, section);
 }
 
-
-#pragma mark - Albums the pane lists, and albums it hides
+#pragma mark - The albums the pane lists
 
 // The pane runs in Settings, which cannot read the photo library, so the album
 // list is gathered from the album cards Photos itself builds and published to
@@ -259,180 +268,163 @@ static void RecordAlbumFromGadget(id gadget) {
     CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
 }
 
-// The "我的相簿" list is a horizontal list of PUAlbumGadget, one per album, fed by
-// PUAlbumsGadgetProvider. Leaving a gadget out of that provider's list is what
-// removes the album's card.
 static NSArray *(*OriginalGadgetProviderGadgets)(id, SEL);
-static id (*OriginalGadgetForIndexPath)(id, SEL, NSIndexPath *);
-static char kGadgetIndexMapKey;
 
-// Leaving a hidden album's gadget out of `gadgets` shortens the list, so every
-// later position must be translated back through the indices kept here.
 static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     NSArray *gadgets = OriginalGadgetProviderGadgets(self, _cmd);
-    Class albumsProvider = objc_getClass("PUAlbumsGadgetProvider");
-    if (albumsProvider == Nil || ![self isKindOfClass:albumsProvider]) {
-        return gadgets;
-    }
     for (id gadget in gadgets) {
         RecordAlbumFromGadget(gadget);
     }
     return gadgets;
 }
 
-// The album cards are laid out by PXHorizontalCollectionGadget, which keeps its
-// own order: dropping an entry or translating its position moves every card
-// after it. So the list is left exactly as Photos built it and a hidden album's
-// card is simply not drawn.
-static id (*OriginalCellForItemAtIndexPath)(id, SEL, UICollectionView *, NSIndexPath *);
+#pragma mark - The album cards
 
-static PHAssetCollection *AlbumAtGadgetIndexPath(id horizontalGadget, NSIndexPath *indexPath);
-static NSUInteger HiddenAlbumCountBefore(id horizontalGadget, NSIndexPath *indexPath);
-static CGFloat AlbumCardStep(id horizontalGadget, UICollectionView *collectionView,
-                             NSIndexPath *indexPath);
+// "我的相簿" is one list of PUAlbumGadget positions, its cells laid out by
+// PUDoubleHeightHorizontalAlbumListGadgetLayout: item i sits in column i/2, row
+// i%2. Dropping a hidden album from the provider's array breaks Photos' own
+// indexing (it kept asking for index 10 of a 7 item array and crashed), so the
+// array is left alone and the layout is given the visible arrangement instead.
+static char kAlbumSlotMapKey;
 
-static UICollectionViewCell *HookedCellForItemAtIndexPath(id self, SEL _cmd,
-                                                          UICollectionView *collectionView,
-                                                          NSIndexPath *indexPath) {
-    UICollectionViewCell *cell = OriginalCellForItemAtIndexPath(self, _cmd, collectionView, indexPath);
-    PHAssetCollection *collection = AlbumAtGadgetIndexPath(self, indexPath);
-    if (collection != nil && AlbumIsHidden(collection)) {
-        cell.hidden = YES;
-    } else if (cell.hidden) {
-        cell.hidden = NO;
-    }
-
-    // Closing the gap: a hidden card keeps its slot, so every card after it is
-    // drawn shifted left by that many slots. Positions come from the layout
-    // itself, nothing is hard-coded.
-    NSUInteger hiddenBefore = HiddenAlbumCountBefore(self, indexPath);
-    CGAffineTransform transform = cell.transform;
-    transform.tx = 0;
-    transform.ty = 0;
-    cell.transform = transform;
-    (void)hiddenBefore;
-    return cell;
-}
-
-static NSUInteger HiddenAlbumCountBefore(id horizontalGadget, NSIndexPath *indexPath) {
-    NSUInteger count = 0;
-    for (NSInteger item = 0; item < indexPath.item; item++) {
-        NSIndexPath *earlier = [NSIndexPath indexPathForItem:item inSection:indexPath.section];
-        PHAssetCollection *collection = AlbumAtGadgetIndexPath(horizontalGadget, earlier);
-        if (collection != nil && AlbumIsHidden(collection)) {
-            count++;
-        }
-    }
-    return count;
-}
-
-static CGFloat AlbumCardStep(id horizontalGadget, UICollectionView *collectionView,
-                             NSIndexPath *indexPath) {
-    UICollectionViewLayoutAttributes *current =
-        [collectionView layoutAttributesForItemAtIndexPath:indexPath];
-    if (current == nil) {
-        return 0;
-    }
-    NSIndexPath *nextPath = [NSIndexPath indexPathForItem:indexPath.item + 1
-                                              inSection:indexPath.section];
-    UICollectionViewLayoutAttributes *next =
-        [collectionView layoutAttributesForItemAtIndexPath:nextPath];
-    CGFloat step = current.frame.size.width;
-    if (next != nil) {
-        CGFloat spacing = next.frame.origin.x - (current.frame.origin.x + current.frame.size.width);
-        if (spacing > 0 && spacing < step) {
-            step += spacing;
-        }
-    }
-    (void)horizontalGadget;
-    return step;
-}
-
-static PHAssetCollection *AlbumAtGadgetIndexPath(id horizontalGadget, NSIndexPath *indexPath) {
+// One pass over the provider's albums, cached per provider until the switches
+// change or the list does: `hidden` says which albums the pane hides, `slots`
+// says which visible position each album takes.
+static NSDictionary *AlbumSlotMap(id albumListGadget) {
     id provider = nil;
     @try {
-        provider = [horizontalGadget valueForKey:@"provider"];
+        provider = [albumListGadget valueForKey:@"provider"];
     } @catch (NSException *exception) {
         (void)exception;
     }
-    if (provider == nil || ![provider respondsToSelector:@selector(gadgetForIndexPath:)]) {
+    if (provider == nil || ![provider respondsToSelector:@selector(gadgets)]) {
         return nil;
     }
-    id gadget = nil;
+    NSArray *gadgets = nil;
     @try {
-        gadget = [(id)provider performSelector:@selector(gadgetForIndexPath:) withObject:indexPath];
+        gadgets = [(id)provider performSelector:@selector(gadgets)];
     } @catch (NSException *exception) {
         (void)exception;
     }
-    if (gadget != nil && [gadget respondsToSelector:@selector(collection)]) {
-        return [(PUAlbumGadget *)gadget collection];
+    if (![gadgets isKindOfClass:[NSArray class]]) {
+        return nil;
     }
-    return nil;
+
+    NSDictionary *cached = objc_getAssociatedObject(provider, &kAlbumSlotMapKey);
+    if ([cached[@"generation"] intValue] == gSettingsGeneration &&
+        [cached[@"count"] unsignedIntegerValue] == gadgets.count) {
+        return cached;
+    }
+
+    NSMutableArray<NSNumber *> *hidden = [NSMutableArray arrayWithCapacity:gadgets.count];
+    NSMutableArray<NSNumber *> *slots = [NSMutableArray arrayWithCapacity:gadgets.count];
+    NSUInteger visible = 0;
+    for (id gadget in gadgets) {
+        PHAssetCollection *collection = nil;
+        if ([gadget respondsToSelector:@selector(collection)]) {
+            @try {
+                collection = [(PUAlbumGadget *)gadget collection];
+            } @catch (NSException *exception) {
+                (void)exception;
+            }
+        }
+        BOOL isHidden = collection != nil && AlbumIsHidden(collection);
+        [hidden addObject:@(isHidden)];
+        [slots addObject:@(visible)];
+        if (!isHidden) {
+            visible++;
+        }
+    }
+    NSDictionary *map = @{@"generation": @(gSettingsGeneration),
+                          @"count": @(gadgets.count),
+                          @"hidden": hidden,
+                          @"slots": slots};
+    objc_setAssociatedObject(provider, &kAlbumSlotMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return map;
 }
 
-// The album row is a two-row layout: item i sits at column i/2, row i%2. A
-// hidden album is dropped from that sequence, so every visible card after it is
-// given an earlier slot. Metrics come from the layout's own attributes.
-static char kDoubleHeightMetricsKey;
+static char kAlbumLayoutMetricsKey;
+static char kAlbumListLayoutKey;
 
-static PHAssetCollection *AlbumAtIndexPath(id albumListGadget, NSIndexPath *indexPath);
+static UICollectionViewLayoutAttributes *(*OriginalAlbumLayoutItem)(id, SEL, NSIndexPath *);
 
-static UICollectionViewLayoutAttributes *(*OriginalDoubleHeightItem)(id, SEL, NSIndexPath *);
-
+// Column step and row offset, read from the layout's own attributes once and kept
+// on the layout instance.
 static BOOL AlbumLayoutMetrics(id layout, SEL _cmd, CGFloat *columnStep, CGFloat *rowOffset) {
-    NSArray *cached = objc_getAssociatedObject(layout, &kDoubleHeightMetricsKey);
+    NSArray *cached = objc_getAssociatedObject(layout, &kAlbumLayoutMetricsKey);
     if ([cached isKindOfClass:[NSArray class]] && cached.count == 2) {
         *columnStep = [cached[0] doubleValue];
         *rowOffset = [cached[1] doubleValue];
         return *columnStep > 0 && *rowOffset > 0;
     }
-    NSIndexPath *first = [NSIndexPath indexPathForItem:0 inSection:0];
-    UICollectionViewLayoutAttributes *a0 = OriginalDoubleHeightItem(layout, _cmd, first);
-    UICollectionViewLayoutAttributes *a1 =
-        OriginalDoubleHeightItem(layout, _cmd, [NSIndexPath indexPathForItem:1 inSection:0]);
-    UICollectionViewLayoutAttributes *a2 =
-        OriginalDoubleHeightItem(layout, _cmd, [NSIndexPath indexPathForItem:2 inSection:0]);
-    if (a0 == nil || a1 == nil || a2 == nil) {
+    UICollectionViewLayoutAttributes *first =
+        OriginalAlbumLayoutItem(layout, _cmd, [NSIndexPath indexPathForItem:0 inSection:0]);
+    UICollectionViewLayoutAttributes *second =
+        OriginalAlbumLayoutItem(layout, _cmd, [NSIndexPath indexPathForItem:1 inSection:0]);
+    UICollectionViewLayoutAttributes *third =
+        OriginalAlbumLayoutItem(layout, _cmd, [NSIndexPath indexPathForItem:2 inSection:0]);
+    if (first == nil || second == nil || third == nil) {
         return NO;
     }
-    *columnStep = a2.frame.origin.x - a0.frame.origin.x;
-    *rowOffset = a1.frame.origin.y - a0.frame.origin.y;
+    *columnStep = third.frame.origin.x - first.frame.origin.x;
+    *rowOffset = second.frame.origin.y - first.frame.origin.y;
     if (*columnStep <= 0 || *rowOffset <= 0) {
         return NO;
     }
-    objc_setAssociatedObject(layout, &kDoubleHeightMetricsKey,
+    objc_setAssociatedObject(layout, &kAlbumLayoutMetricsKey,
                              @[@(*columnStep), @(*rowOffset)],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return YES;
 }
 
-static UICollectionViewLayoutAttributes *HookedDoubleHeightItem(id self, SEL _cmd, NSIndexPath *indexPath) {
-    UICollectionViewLayoutAttributes *attributes = OriginalDoubleHeightItem(self, _cmd, indexPath);
-    id dataSource = nil;
-    @try {
-        dataSource = [[self valueForKey:@"collectionView"] dataSource];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
-    if (dataSource == nil || albumListClass == Nil || ![dataSource isKindOfClass:albumListClass]) {
+static UICollectionViewLayoutAttributes *HookedAlbumLayoutItem(id self, SEL _cmd,
+                                                               NSIndexPath *indexPath) {
+    UICollectionViewLayoutAttributes *attributes = OriginalAlbumLayoutItem(self, _cmd, indexPath);
+    if (indexPath.section != 0) {
         return attributes;
     }
-    PHAssetCollection *collection = AlbumAtIndexPath(dataSource, indexPath);
-    if (collection != nil && AlbumIsHidden(collection)) {
+    // Asked once per layout: does this one lay out the album cards at all?
+    NSNumber *isAlbumList = objc_getAssociatedObject(self, &kAlbumListLayoutKey);
+    id dataSource = nil;
+    if (isAlbumList == nil || isAlbumList.boolValue) {
+        @try {
+            dataSource = [[self valueForKey:@"collectionView"] dataSource];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+    }
+    if (isAlbumList == nil) {
+        Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
+        BOOL matches = dataSource != nil && albumListClass != Nil &&
+                       [dataSource isKindOfClass:albumListClass];
+        objc_setAssociatedObject(self, &kAlbumListLayoutKey, @(matches),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!matches) {
+            return attributes;
+        }
+    } else if (!isAlbumList.boolValue || dataSource == nil) {
+        return attributes;
+    }
+
+    NSDictionary *map = AlbumSlotMap(dataSource);
+    NSArray<NSNumber *> *hidden = map[@"hidden"];
+    NSArray<NSNumber *> *slots = map[@"slots"];
+    if (indexPath.item < 0 || (NSUInteger)indexPath.item >= hidden.count) {
+        return attributes;
+    }
+    if (hidden[indexPath.item].boolValue) {
         attributes.hidden = YES;
         return attributes;
     }
-    NSUInteger hiddenBefore = HiddenAlbumCountBefore(dataSource, indexPath);
-    if (hiddenBefore == 0) {
-        return attributes;
+    NSUInteger slot = slots[indexPath.item].unsignedIntegerValue;
+    if (slot == (NSUInteger)indexPath.item) {
+        return attributes;  // nothing hidden before this card
     }
     CGFloat columnStep = 0;
     CGFloat rowOffset = 0;
     if (!AlbumLayoutMetrics(self, _cmd, &columnStep, &rowOffset)) {
         return attributes;
     }
-    NSUInteger slot = (NSUInteger)indexPath.item - hiddenBefore;
     CGRect frame = attributes.frame;
     frame.origin.x = (CGFloat)(slot / 2) * columnStep;
     frame.origin.y = (CGFloat)(slot % 2) * rowOffset;
@@ -440,236 +432,7 @@ static UICollectionViewLayoutAttributes *HookedDoubleHeightItem(id self, SEL _cm
     return attributes;
 }
 
-static char kProviderDumpOnceKey;
-
-static void DumpProviders(id self, NSArray *gadgets) {
-    Class albumGadgetClass = objc_getClass("PUAlbumGadget");
-    BOOL hasAlbumGadget = NO;
-    NSMutableArray *classes = [NSMutableArray array];
-    for (id gadget in gadgets) {
-        NSString *name = NSStringFromClass([gadget class]);
-        if (![classes containsObject:name]) {
-            [classes addObject:name];
-        }
-        if (albumGadgetClass != Nil && [gadget isKindOfClass:albumGadgetClass]) {
-            hasAlbumGadget = YES;
-        }
-    }
-    if (!hasAlbumGadget && classes.count == 0) {
-        return;
-    }
-    NSString *line = [NSString stringWithFormat:@"%@ [%lu] %@",
-                      NSStringFromClass([self class]), (unsigned long)gadgets.count,
-                      [classes componentsJoinedByString:@","]];
-    NSMutableArray *lines = [NSMutableArray array];
-    NSArray *existing = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("providerDump"),
-                                                                   (__bridge CFStringRef)@APELIN_PACKAGE_ID));
-    if ([existing isKindOfClass:[NSArray class]]) {
-        [lines addObjectsFromArray:existing];
-    }
-    if (![lines containsObject:line]) {
-        [lines addObject:line];
-    }
-    CFPreferencesSetAppValue(CFSTR("providerDump"), (__bridge CFPropertyListRef)lines,
-                             (__bridge CFStringRef)@APELIN_PACKAGE_ID);
-    CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
-}
-
-static id HookedGadgetForIndexPath(id self, SEL _cmd, NSIndexPath *indexPath) {
-    NSArray *map = objc_getAssociatedObject(self, &kGadgetIndexMapKey);
-    if (map == nil) {
-        return OriginalGadgetForIndexPath(self, _cmd, indexPath);
-    }
-    NSIndexPath *mapped = nil;
-    if (indexPath.section == 0) {
-        if ((NSUInteger)indexPath.item < map.count) {
-            mapped = [NSIndexPath indexPathForItem:[map[indexPath.item] integerValue] inSection:0];
-        }
-    } else if ((NSUInteger)indexPath.section < map.count) {
-        mapped = [NSIndexPath indexPathForItem:indexPath.item
-                                     inSection:[map[indexPath.section] integerValue]];
-    }
-    return OriginalGadgetForIndexPath(self, _cmd, mapped ?: indexPath);
-}
-
-// A hidden album's card cannot be dropped from the list (its neighbours shift)
-// nor resized to nothing (the layout breaks), so it is laid out hidden: the cell
-// stays in place for indexing and simply is not drawn.
-static PHAssetCollection *AlbumAtIndexPath(id albumListGadget, NSIndexPath *indexPath) {
-    id provider = nil;
-    @try {
-        provider = [albumListGadget valueForKey:@"provider"];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    if (provider == nil || ![provider respondsToSelector:@selector(gadgetForIndexPath:)]) {
-        return nil;
-    }
-    id gadget = nil;
-    @try {
-        gadget = [(id)provider performSelector:@selector(gadgetForIndexPath:) withObject:indexPath];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    if (gadget != nil && [gadget respondsToSelector:@selector(collection)]) {
-        return [(PUAlbumGadget *)gadget collection];
-    }
-    return nil;
-}
-
-static UICollectionViewLayoutAttributes *(*OriginalLayoutAttributesForItem)(id, SEL, NSIndexPath *);
-static char kAlbumListLayoutKey;
-
-static UICollectionViewLayoutAttributes *HookedLayoutAttributesForItem(id self, SEL _cmd,
-                                                                      NSIndexPath *indexPath) {
-    UICollectionViewLayoutAttributes *attributes = OriginalLayoutAttributesForItem(self, _cmd, indexPath);
-    Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
-    if (albumListClass == Nil) {
-        return attributes;
-    }
-    // Whether this layout belongs to the album list is asked once per layout.
-    NSNumber *cached = objc_getAssociatedObject(self, &kAlbumListLayoutKey);
-    id dataSource = nil;
-    if (cached == nil) {
-        @try {
-            UICollectionView *collectionView = [self valueForKey:@"collectionView"];
-            dataSource = collectionView.dataSource;
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
-        BOOL isAlbumList = dataSource != nil && [dataSource isKindOfClass:albumListClass];
-        objc_setAssociatedObject(self, &kAlbumListLayoutKey, @(isAlbumList),
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (!isAlbumList) {
-            return attributes;
-        }
-    } else if (!cached.boolValue) {
-        return attributes;
-    } else {
-        @try {
-            UICollectionView *collectionView = [self valueForKey:@"collectionView"];
-            dataSource = collectionView.dataSource;
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
-    }
-    if (dataSource == nil) {
-        return attributes;
-    }
-    PHAssetCollection *collection = AlbumAtIndexPath(dataSource, indexPath);
-    if (collection != nil && AlbumIsHidden(collection)) {
-        attributes.hidden = YES;
-    }
-    return attributes;
-}
-
-// The list keeps its own array of album gadgets; filtering that array (not the
-// provider's) keeps its counts, cells and indices consistent.
-static void FilterAlbumListGadgetArrays(id albumList) {
-    Class cls = object_getClass(albumList);
-    for (Class klass = cls; klass != Nil; klass = class_getSuperclass(klass)) {
-        unsigned int count = 0;
-        Ivar *ivars = class_copyIvarList(klass, &count);
-        for (unsigned int i = 0; i < count; i++) {
-            const char *type = ivar_getTypeEncoding(ivars[i]);
-            if (type == NULL || type[0] != '@') {
-                continue;
-            }
-            id value = object_getIvar(albumList, ivars[i]);
-            if (![value isKindOfClass:[NSArray class]] || [value count] == 0) {
-                continue;
-            }
-            BOOL hasAlbumGadget = NO;
-            BOOL hasHidden = NO;
-            for (id element in (NSArray *)value) {
-                if (![element respondsToSelector:@selector(collection)]) {
-                    continue;
-                }
-                hasAlbumGadget = YES;
-                PHAssetCollection *collection = nil;
-                @try {
-                    collection = [(PUAlbumGadget *)element collection];
-                } @catch (NSException *exception) {
-                    (void)exception;
-                }
-                if (collection != nil && AlbumIsHidden(collection)) {
-                    hasHidden = YES;
-                    break;
-                }
-            }
-            if (!hasAlbumGadget || !hasHidden) {
-                continue;
-            }
-            NSMutableArray *kept = [NSMutableArray array];
-            for (id element in (NSArray *)value) {
-                PHAssetCollection *collection = nil;
-                if ([element respondsToSelector:@selector(collection)]) {
-                    @try {
-                        collection = [(PUAlbumGadget *)element collection];
-                    } @catch (NSException *exception) {
-                        (void)exception;
-                    }
-                }
-                if (collection != nil && AlbumIsHidden(collection)) {
-                    continue;
-                }
-                [kept addObject:element];
-            }
-            object_setIvar(albumList, ivars[i], kept);
-            // Keep the replacement alive: object_setIvar does not retain for us.
-            objc_setAssociatedObject(albumList, ivars[i], kept, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        free(ivars);
-    }
-}
-
-static id (*OriginalInitWithAlbumsGadgetProvider)(id, SEL, id);
-
-static id HookedInitWithAlbumsGadgetProvider(id self, SEL _cmd, id provider) {
-    id result = OriginalInitWithAlbumsGadgetProvider(self, _cmd, provider);
-    @try {
-        FilterAlbumListGadgetArrays(result);
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    return result;
-}
-
-static void (*OriginalReconfigureGadgets)(id, SEL);
-
-static void HookedReconfigureGadgets(id self, SEL _cmd) {
-    OriginalReconfigureGadgets(self, _cmd);
-    @try {
-        FilterAlbumListGadgetArrays(self);
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-}
-
-static void ProbeCellDataSource(void) {
-    NSMutableArray *lines = [NSMutableArray array];
-    Class horizontal = objc_getClass("PXHorizontalCollectionGadget");
-    if (horizontal != Nil) {
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(horizontal, &count);
-        for (unsigned int i = 0; i < count; i++) {
-            [lines addObject:NSStringFromSelector(method_getName(methods[i]))];
-        }
-        free(methods);
-        // Ivars say where the gadget list is kept.
-        unsigned int ivarCount = 0;
-        Ivar *ivars = class_copyIvarList(horizontal, &ivarCount);
-        for (unsigned int i = 0; i < ivarCount; i++) {
-            NSString *name = @(ivar_getName(ivars[i]));
-            const char *type = ivar_getTypeEncoding(ivars[i]);
-            [lines addObject:[NSString stringWithFormat:@"ivar:%@:%s", name, type ?: "?"]];
-        }
-        free(ivars);
-    }
-    CFPreferencesSetAppValue(CFSTR("cellProbe"), (__bridge CFPropertyListRef)lines,
-                             (__bridge CFStringRef)@APELIN_PACKAGE_ID);
-    CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
-}
+#pragma mark - Hooks
 
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
     if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
@@ -706,54 +469,10 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     HookSelector(gadgetController, @selector(collectionView:layout:referenceSizeForHeaderInSection:),
                  (IMP)HookedHeaderSize, (IMP *)&OriginalHeaderSize);
 
-    Class albumsProvider = objc_getClass("PUAlbumsGadgetProvider");
-    if (albumsProvider != Nil && class_getInstanceMethod(albumsProvider, @selector(gadgets)) != NULL) {
-        MSHookMessageEx(albumsProvider, @selector(gadgets),
-                        (IMP)HookedGadgetProviderGadgets, (IMP *)&OriginalGadgetProviderGadgets);
-    } else {
-        Class baseProvider = objc_getClass("PXGadgetProvider");
-        if (baseProvider != Nil && class_getInstanceMethod(baseProvider, @selector(gadgets)) != NULL) {
-            MSHookMessageEx(baseProvider, @selector(gadgets),
-                            (IMP)HookedGadgetProviderGadgets, (IMP *)&OriginalGadgetProviderGadgets);
-        }
-    }
+    HookSelector(objc_getClass("PUAlbumsGadgetProvider"), @selector(gadgets),
+                 (IMP)HookedGadgetProviderGadgets, (IMP *)&OriginalGadgetProviderGadgets);
 
-    if (albumsProvider != Nil &&
-        class_getInstanceMethod(albumsProvider, @selector(_newGadgetForCollection:)) != NULL) {
-        // Kept unhooked: returning nil from this creation point terminates Photos.
-    }
-
-    Class collectionViewClass = objc_getClass("UICollectionView");
-    if (collectionViewClass != Nil) {
-        (void)collectionViewClass;
-    }
-
-    Class albumList = objc_getClass("PUHorizontalAlbumListGadget");
-    if (albumList != Nil) {
-        (void)albumList;
-    }
-
-    Class layoutClass = objc_getClass("UICollectionViewLayout");
-    if (layoutClass != Nil &&
-        class_getInstanceMethod(layoutClass, @selector(layoutAttributesForItemAtIndexPath:)) != NULL) {
-        MSHookMessageEx(layoutClass, @selector(layoutAttributesForItemAtIndexPath:),
-                        (IMP)HookedLayoutAttributesForItem, (IMP *)&OriginalLayoutAttributesForItem);
-    }
-
-    Class horizontalGadget = objc_getClass("PXHorizontalCollectionGadget");
-    if (horizontalGadget != Nil &&
-        class_getInstanceMethod(horizontalGadget, @selector(collectionView:cellForItemAtIndexPath:)) != NULL) {
-        MSHookMessageEx(horizontalGadget, @selector(collectionView:cellForItemAtIndexPath:),
-                        (IMP)HookedCellForItemAtIndexPath,
-                        (IMP *)&OriginalCellForItemAtIndexPath);
-    }
-
-    Class doubleHeightLayout = objc_getClass("PUDoubleHeightHorizontalAlbumListGadgetLayout");
-    if (doubleHeightLayout != Nil &&
-        class_getInstanceMethod(doubleHeightLayout, @selector(layoutAttributesForItemAtIndexPath:)) != NULL) {
-        MSHookMessageEx(doubleHeightLayout, @selector(layoutAttributesForItemAtIndexPath:),
-                        (IMP)HookedDoubleHeightItem, (IMP *)&OriginalDoubleHeightItem);
-    }
-
-    ProbeCellDataSource();
+    HookSelector(objc_getClass("PUDoubleHeightHorizontalAlbumListGadgetLayout"),
+                 @selector(layoutAttributesForItemAtIndexPath:),
+                 (IMP)HookedAlbumLayoutItem, (IMP *)&OriginalAlbumLayoutItem);
 }
