@@ -162,9 +162,9 @@
   },
   "package": {
     "id": "com.simon.hidden-album",
-    "name": "隐藏相册隐藏",
+    "name": "相册增强",
     "version": "0.1.0",
-    "description": "把照片 App「已隐藏」相簿内容隐藏为空并显示“无照片或视频”，带偏好设置开关。",
+    "description": "照片 App 增强：让「已隐藏」相簿显示为「无照片或视频」、隐藏「人物与地点」分组，并可单独隐藏「我的相簿」中的任意相簿，全部由设置项控制。",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "Simon",
     "section": "Tweaks",
