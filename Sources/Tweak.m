@@ -243,6 +243,14 @@ static void RecordAlbumFromGadget(id gadget) {
     if (identifier.length == 0 || title.length == 0 || [seen containsObject:identifier]) {
         return;
     }
+    // People and Places have their own switch above; they are not albums here.
+    NSString *gadgetClass = NSStringFromClass([gadget class]);
+    if ([gadgetClass containsString:@"People"] || [gadgetClass containsString:@"Place"] ||
+        [title containsString:@"人物"] || [title containsString:@"地点"] ||
+        [title rangeOfString:@"people" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+        [title rangeOfString:@"places" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        return;
+    }
     [seen addObject:identifier];
     [albums addObject:@{@"id": identifier, @"title": title}];
     CFPreferencesSetAppValue(CFSTR("albumInventory"),

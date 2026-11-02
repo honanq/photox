@@ -50,6 +50,24 @@
 			<key>PostNotification</key>
 			<string>com.simon.hidden-album/changed</string>
 		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>单个相簿</string>
+			<key>footerText</key>
+			<string>按相簿逐个选择是否从「相簿」页隐藏。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSLinkCell</string>
+			<key>label</key>
+			<string>选择要隐藏的相簿</string>
+			<key>detail</key>
+			<string>HiddenAlbumAlbumsController</string>
+			<key>isController</key>
+			<true/>
+		</dict>
 	</array>
 </dict>
 </plist>
