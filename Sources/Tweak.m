@@ -287,6 +287,9 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
 static id (*OriginalCellForItemAtIndexPath)(id, SEL, UICollectionView *, NSIndexPath *);
 
 static PHAssetCollection *AlbumAtGadgetIndexPath(id horizontalGadget, NSIndexPath *indexPath);
+static NSUInteger HiddenAlbumCountBefore(id horizontalGadget, NSIndexPath *indexPath);
+static CGFloat AlbumCardStep(id horizontalGadget, UICollectionView *collectionView,
+                             NSIndexPath *indexPath);
 
 static UICollectionViewCell *HookedCellForItemAtIndexPath(id self, SEL _cmd,
                                                           UICollectionView *collectionView,
@@ -298,7 +301,56 @@ static UICollectionViewCell *HookedCellForItemAtIndexPath(id self, SEL _cmd,
     } else if (cell.hidden) {
         cell.hidden = NO;
     }
+
+    // Closing the gap: a hidden card keeps its slot, so every card after it is
+    // drawn shifted left by that many slots. Positions come from the layout
+    // itself, nothing is hard-coded.
+    NSUInteger hiddenBefore = HiddenAlbumCountBefore(self, indexPath);
+    CGAffineTransform transform = cell.transform;
+    if (hiddenBefore > 0) {
+        CGFloat step = AlbumCardStep(self, collectionView, indexPath);
+        transform.tx = -(CGFloat)hiddenBefore * step;
+        transform.ty = 0;
+    } else {
+        transform.tx = 0;
+        transform.ty = 0;
+    }
+    cell.transform = transform;
     return cell;
+}
+
+static NSUInteger HiddenAlbumCountBefore(id horizontalGadget, NSIndexPath *indexPath) {
+    NSUInteger count = 0;
+    for (NSInteger item = 0; item < indexPath.item; item++) {
+        NSIndexPath *earlier = [NSIndexPath indexPathForItem:item inSection:indexPath.section];
+        PHAssetCollection *collection = AlbumAtGadgetIndexPath(horizontalGadget, earlier);
+        if (collection != nil && AlbumIsHidden(collection)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static CGFloat AlbumCardStep(id horizontalGadget, UICollectionView *collectionView,
+                             NSIndexPath *indexPath) {
+    UICollectionViewLayoutAttributes *current =
+        [collectionView layoutAttributesForItemAtIndexPath:indexPath];
+    if (current == nil) {
+        return 0;
+    }
+    NSIndexPath *nextPath = [NSIndexPath indexPathForItem:indexPath.item + 1
+                                              inSection:indexPath.section];
+    UICollectionViewLayoutAttributes *next =
+        [collectionView layoutAttributesForItemAtIndexPath:nextPath];
+    CGFloat step = current.frame.size.width;
+    if (next != nil) {
+        CGFloat spacing = next.frame.origin.x - (current.frame.origin.x + current.frame.size.width);
+        if (spacing > 0 && spacing < step) {
+            step += spacing;
+        }
+    }
+    (void)horizontalGadget;
+    return step;
 }
 
 static PHAssetCollection *AlbumAtGadgetIndexPath(id horizontalGadget, NSIndexPath *indexPath) {
@@ -442,33 +494,6 @@ static UICollectionViewLayoutAttributes *HookedLayoutAttributesForItem(id self, 
     PHAssetCollection *collection = AlbumAtIndexPath(dataSource, indexPath);
     if (collection != nil && AlbumIsHidden(collection)) {
         attributes.hidden = YES;
-    }
-
-    // A hidden card keeps its place in the data; move everything after it to the
-    // left so its slot closes up instead of showing as a gap.
-    NSUInteger hiddenBefore = 0;
-    for (NSUInteger item = 0; item < (NSUInteger)indexPath.item; item++) {
-        NSIndexPath *earlier = [NSIndexPath indexPathForItem:item inSection:indexPath.section];
-        PHAssetCollection *earlierCollection = AlbumAtIndexPath(dataSource, earlier);
-        if (earlierCollection != nil && AlbumIsHidden(earlierCollection)) {
-            hiddenBefore++;
-        }
-    }
-    if (hiddenBefore > 0) {
-        NSIndexPath *nextPath = [NSIndexPath indexPathForItem:indexPath.item + 1
-                                                  inSection:indexPath.section];
-        UICollectionViewLayoutAttributes *next =
-            OriginalLayoutAttributesForItem(self, _cmd, nextPath);
-        CGFloat step = attributes.frame.size.width;
-        if (next != nil) {
-            CGFloat spacing = next.frame.origin.x - (attributes.frame.origin.x + attributes.frame.size.width);
-            if (spacing > 0 && spacing < step) {
-                step += spacing;
-            }
-        }
-        CGRect frame = attributes.frame;
-        frame.origin.x -= hiddenBefore * step;
-        attributes.frame = frame;
     }
     return attributes;
 }
