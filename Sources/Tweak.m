@@ -9,14 +9,12 @@
 // The album grid does not render +[PHAsset fetchAssetsInAssetCollection:options:]:
 // Photos asks its PhotosUI data source for counts instead, a PXPhotosDataSource
 // whose containerCollection is the "Hidden" smart album (type 2, subtype 205).
-// Making that data source answer zero items leaves the section in place and the
-// grid shows its empty state, which is what an album with no items looks like.
-// The PhotoKit fetch is emptied too, so the album's own count agrees.
+// Making that data source answer zero sections leaves the grid showing its own
+// empty state, which is what an album with no items looks like.
 //
-// Photos runs PhotoKit in multi-library mode, where the single-library fetch
-// APIs raise "Calling single library mode API while in multi library mode",
-// and calling PhotoKit from inside a PhotoKit fetch was seen to hang the app:
-// the empty result is therefore built once, off the fetch path.
+// Photos no longer asks for Face ID once the album reads as empty, so the tweak
+// asks itself and keeps a plain cover over the album until the person passes
+// it: blank before, "无照片或视频" after.
 //
 // The build defines APELIN_PACKAGE_ID, APELIN_VERSION and APELIN_BUILD_ID as
 // string literals on every compile.
@@ -117,15 +115,11 @@ static BOOL ReadEnabledFromPreferences(void) {
 }
 
 // Read once, and again only when something says the value may have changed:
-// the pane's Darwin notification, or the app coming back to the front (the way
-// a change made in Settings reaches Photos). Nothing here polls.
+// the pane's Darwin notification, or the app coming back to the front. Nothing
+// here polls.
 static BOOL HiddenContentsEnabled(void) {
     if (!gLoaded) {
-        BOOL enabled = ReadEnabledFromPreferences();
-        if (enabled != gEnabled) {
-            FileLog(@"setting read enabled=%d", enabled ? 1 : 0);
-        }
-        gEnabled = enabled;
+        gEnabled = ReadEnabledFromPreferences();
         gLoaded = YES;
     }
     return gEnabled;
@@ -188,7 +182,8 @@ static BOOL IsHiddenSmartAlbum(PHAssetCollection *collection) {
 }
 
 // The empty fetch result, built off the fetch path: 0 not tried, 1 building,
-// 2 ready, -1 no way works.
+// 2 ready, -1 no way works. Photos' multi library mode refuses a fetch result
+// built from a single library, so it is built with the fetch's own options.
 static PHFetchResult<PHAsset *> *gEmptyResult = nil;
 static NSInteger gEmptyState = 0;
 static PHFetchOptions *gHiddenOptions = nil;
@@ -201,7 +196,6 @@ static void BuildEmptyResult(void) {
         if (result != nil && result.count == 0) {
             gEmptyResult = result;
             gEmptyState = 2;
-            FileLog(@"empty fetch result ready");
             return;
         }
     } @catch (NSException *exception) {
@@ -225,8 +219,6 @@ static PHFetchResult<PHAsset *> *HookedFetchAssetsInAssetCollection(id self, SEL
     if (!IsHiddenSmartAlbum(collection) || !HiddenContentsEnabled()) {
         return original;
     }
-    FileLog(@"hidden collection fetch orig=%lu empty=%d",
-            (unsigned long)original.count, gEmptyResult != nil ? 1 : 0);
     if (gEmptyResult != nil) {
         return gEmptyResult;
     }
@@ -294,62 +286,72 @@ static BOOL DataSourceIsHiddenAlbum(id dataSource) {
     return hidden;
 }
 
-// The album is empty for us, so Photos no longer asks for Face ID before
-// showing it. Ask once per visit, and only show the empty state once the
-// person passed it: until then the grid stays blank.
-static char kAskedFaceIDKey;
-static __weak id gHiddenDataSource = nil;
-static BOOL gHiddenAlbumAuthenticated = NO;
-static BOOL gDumpedMethods = NO;
+#pragma mark - Face ID and the cover over the album
 
-// Any change here must make Photos ask for the counts again, or the grid keeps
-// what it last drew.
-static void ForceDataSourceRefresh(id dataSource) {
-    if (dataSource == nil) {
-        return;
-    }
-    for (NSString *name in @[@"setNeedsUpdate", @"updateIfNeeded", @"reloadData",
-                             @"invalidateLayout"]) {
-        SEL selector = NSSelectorFromString(name);
-        if (![dataSource respondsToSelector:selector]) {
+// Photos no longer asks for Face ID for an album it reads as empty, so this
+// asks, and covers the album in plain background colour until it is passed.
+static char kAskedFaceIDKey;
+static __weak UIView *gCoverView = nil;
+static BOOL gAuthenticated = NO;
+
+static UIViewController *TopViewController(void) {
+    UIWindow *keyWindow = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
             continue;
         }
-        @try {
-            NSMethodSignature *signature = [dataSource methodSignatureForSelector:selector];
-            if (signature != nil && signature.numberOfArguments == 2) {
-                NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
-                invocation.target = dataSource;
-                invocation.selector = selector;
-                [invocation invoke];
-                FileLog(@"refresh %@ via %@", NSStringFromClass([dataSource class]), name);
-                return;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.isKeyWindow) {
+                keyWindow = window;
+                break;
             }
-        } @catch (NSException *exception) {
-            FileLog(@"refresh %@ threw: %@", name, exception.reason);
+        }
+        if (keyWindow != nil) {
+            break;
         }
     }
-    FileLog(@"refresh %@: no selector worked", NSStringFromClass([dataSource class]));
+    UIViewController *controller = keyWindow.rootViewController;
+    while (controller.presentedViewController != nil) {
+        controller = controller.presentedViewController;
+    }
+    if ([controller isKindOfClass:[UINavigationController class]]) {
+        controller = ((UINavigationController *)controller).topViewController;
+    }
+    if ([controller isKindOfClass:[UITabBarController class]]) {
+        controller = ((UITabBarController *)controller).selectedViewController;
+    }
+    return controller;
 }
 
-// Diagnostic: which methods could refresh the grid, for the next build.
-static void DumpDataSourceMethodsOnce(id dataSource) {
-    if (gDumpedMethods) {
-        return;
-    }
-    gDumpedMethods = YES;
-    NSMutableString *names = [NSMutableString string];
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList([dataSource class], &count);
-    for (unsigned int i = 0; i < count; i++) {
-        NSString *name = NSStringFromSelector(method_getName(methods[i]));
-        if ([name rangeOfString:@"update"].location != NSNotFound ||
-            [name rangeOfString:@"reload"].location != NSNotFound ||
-            [name rangeOfString:@"change"].location != NSNotFound) {
-            [names appendFormat:@" %@", name];
+static void ShowCover(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gCoverView != nil) {
+            return;
         }
-    }
-    free(methods);
-    FileLog(@"methods %@:%@", NSStringFromClass([dataSource class]), names);
+        UIViewController *controller = TopViewController();
+        UIView *host = controller.view;
+        if (host == nil) {
+            return;
+        }
+        UIView *cover = [[UIView alloc] initWithFrame:host.bounds];
+        cover.backgroundColor = [UIColor systemBackgroundColor];
+        cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        cover.userInteractionEnabled = YES;
+        [host addSubview:cover];
+        gCoverView = cover;
+        FileLog(@"cover shown over %@", NSStringFromClass([controller class]));
+    });
+}
+
+static void HideCover(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gCoverView == nil) {
+            return;
+        }
+        [gCoverView removeFromSuperview];
+        gCoverView = nil;
+        FileLog(@"cover removed");
+    });
 }
 
 static void RequestFaceIDForHiddenAlbum(id dataSource) {
@@ -357,10 +359,12 @@ static void RequestFaceIDForHiddenAlbum(id dataSource) {
     static __unsafe_unretained id lastDataSource = nil;
     if (dataSource != lastDataSource) {
         lastDataSource = dataSource;
-        gHiddenAlbumAuthenticated = NO;
+        gAuthenticated = NO;
+        ShowCover();
     }
-    gHiddenDataSource = dataSource;
-    DumpDataSourceMethodsOnce(dataSource);
+    if (gAuthenticated) {
+        return;
+    }
     if (objc_getAssociatedObject(dataSource, &kAskedFaceIDKey) != nil) {
         return;
     }
@@ -378,12 +382,10 @@ static void RequestFaceIDForHiddenAlbum(id dataSource) {
                           reply:^(BOOL success, NSError *authError) {
             FileLog(@"faceid success=%d error=%@", success ? 1 : 0, authError.localizedDescription);
             if (!success) {
-                return;
+                return;  // The cover stays: blank until the album is opened again.
             }
-            gHiddenAlbumAuthenticated = YES;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                ForceDataSourceRefresh(gHiddenDataSource);
-            });
+            gAuthenticated = YES;
+            HideCover();
         }];
     });
 }
@@ -396,12 +398,6 @@ static long HookedNumberOfItemsInSection(id self, SEL _cmd, long section) {
                         : 0;
     if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
         RequestFaceIDForHiddenAlbum(self);
-        static NSInteger logged = 0;
-        if (logged < 10) {
-            logged++;
-            FileLog(@"grid %@ numberOfItemsInSection=%ld orig=%ld -> 0",
-                    NSStringFromClass([self class]), section, original);
-        }
         return 0;
     }
     return original;
@@ -413,16 +409,7 @@ static long HookedNumberOfSections(id self, SEL _cmd) {
     long original = OriginalNumberOfSections != NULL ? OriginalNumberOfSections(self, _cmd) : 0;
     if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
         RequestFaceIDForHiddenAlbum(self);
-        static NSInteger logged = 0;
-        if (logged < 10) {
-            logged++;
-            FileLog(@"grid %@ numberOfSections orig=%ld authenticated=%d",
-                    NSStringFromClass([self class]), original, gHiddenAlbumAuthenticated ? 1 : 0);
-        }
-        // Before the person passed Face ID the section stays (with no items,
-        // so nothing shows); afterwards the album reads as empty and Photos
-        // draws its own "无照片或视频".
-        return gHiddenAlbumAuthenticated ? 0 : original;
+        return 0;
     }
     return original;
 }
@@ -431,7 +418,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     // Apelin's confirm_loaded looks for this exact marker and build id under
     // the package id's subsystem. Keep the line, and keep it public.
     os_log(TweakLog(), "ApelinLoaded %{public}s in %{public}s", APELIN_BUILD_ID, getprogname());
-    FileLog(@"=== loaded %@ in %s, log at %@", @APELIN_BUILD_ID, getprogname(), DebugLogPath());
+    FileLog(@"=== loaded %@ in %s", @APELIN_BUILD_ID, getprogname());
 
     StartListeningForSettingChanges();
 
@@ -450,9 +437,6 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                         @selector(numberOfItemsInSection:),
                         (IMP)HookedNumberOfItemsInSection,
                         (IMP *)&OriginalNumberOfItemsInSection);
-        FileLog(@"hooked -[PXPhotosDataSource numberOfItemsInSection:]");
-    } else {
-        FileLog(@"PXPhotosDataSource numberOfItemsInSection: missing");
     }
     if (photosDataSource != Nil &&
         class_getInstanceMethod(photosDataSource, @selector(numberOfSections)) != NULL) {
@@ -460,8 +444,5 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                         @selector(numberOfSections),
                         (IMP)HookedNumberOfSections,
                         (IMP *)&OriginalNumberOfSections);
-        FileLog(@"hooked -[PXPhotosDataSource numberOfSections]");
-    } else {
-        FileLog(@"PXPhotosDataSource numberOfSections missing");
     }
 }
