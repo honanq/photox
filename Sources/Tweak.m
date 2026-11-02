@@ -21,9 +21,12 @@ static BOOL gHideHiddenAlbum = YES;
 static BOOL gHidePeopleAndPlaces = YES;
 static BOOL gLoaded = NO;
 
+static NSUserDefaults *Preferences(void) {
+    return [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
+}
+
 static BOOL BoolFromPreferences(NSString *key, BOOL fallback) {
-    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
-    id value = [defaults objectForKey:key];
+    id value = [Preferences() objectForKey:key];
     if (value != nil && [value respondsToSelector:@selector(boolValue)]) {
         return [value boolValue];
     }
@@ -184,7 +187,6 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
     return OriginalHeaderSize(self, _cmd, collectionView, layout, section);
 }
 
-#pragma mark - Loading
 
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
     if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
