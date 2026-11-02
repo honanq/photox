@@ -278,6 +278,51 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
         RecordAlbumFromGadget(gadget);
     }
 
+    {
+        NSString *providerName = NSStringFromClass([self class]);
+        NSString *listType = @"-";
+        @try {
+            id type = [self valueForKey:@"albumListType"];
+            listType = [type description];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        NSMutableArray *identity = [NSMutableArray array];
+        for (id gadget in gadgets) {
+            PHAssetCollection *c = nil;
+            if ([gadget respondsToSelector:@selector(collection)]) {
+                @try {
+                    c = [(PUAlbumGadget *)gadget collection];
+                } @catch (NSException *exception) {
+                    (void)exception;
+                }
+            }
+            [identity addObject:[NSString stringWithFormat:@"%@|%@|%lu|%lu|%@|%@",
+                                 NSStringFromClass([gadget class]),
+                                 c ? @"col" : @"nil",
+                                 (unsigned long)(c ? c.assetCollectionType : 999),
+                                 (unsigned long)(c ? c.assetCollectionSubtype : 999),
+                                 c.localIdentifier ?: @"-",
+                                 (c != nil && AlbumIsHidden(c)) ? @"HIDDEN" : @"-"]];
+        }
+        NSString *entry = [NSString stringWithFormat:@"=== %@ type=%@ n=%lu\n%@",
+                           providerName, listType, (unsigned long)gadgets.count,
+                           [identity componentsJoinedByString:@"\n"]];
+        NSMutableArray *lines = [NSMutableArray array];
+        id existing = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("gadgetDump"),
+                                                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID));
+        if ([existing isKindOfClass:[NSArray class]]) {
+            [lines addObjectsFromArray:existing];
+        }
+        if (![lines containsObject:entry] && lines.count < 40) {
+            [lines addObject:entry];
+        }
+        CFPreferencesSetAppValue(CFSTR("gadgetDump"),
+                                 (__bridge CFPropertyListRef)lines,
+                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID);
+        CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
+    }
+
     NSMutableArray *kept = [NSMutableArray arrayWithCapacity:gadgets.count];
     NSMutableArray *map = [NSMutableArray arrayWithCapacity:gadgets.count];
     for (NSUInteger i = 0; i < gadgets.count; i++) {
@@ -299,8 +344,59 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     if (kept.count == gadgets.count) {
         return gadgets;
     }
+    {
+        NSMutableArray *lines = [NSMutableArray array];
+        id existing = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("filterLog"),
+                                                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID));
+        if ([existing isKindOfClass:[NSArray class]]) {
+            [lines addObjectsFromArray:existing];
+        }
+        NSString *line = [NSString stringWithFormat:@"%@ %lu -> %lu", NSStringFromClass([self class]),
+                          (unsigned long)gadgets.count, (unsigned long)kept.count];
+        if (![lines containsObject:line] && lines.count < 20) {
+            [lines addObject:line];
+        }
+        CFPreferencesSetAppValue(CFSTR("filterLog"), (__bridge CFPropertyListRef)lines,
+                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID);
+        CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
+    }
     objc_setAssociatedObject(self, &kGadgetIndexMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return [kept copy];
+}
+
+static char kProviderDumpOnceKey;
+
+static void DumpProviders(id self, NSArray *gadgets) {
+    Class albumGadgetClass = objc_getClass("PUAlbumGadget");
+    BOOL hasAlbumGadget = NO;
+    NSMutableArray *classes = [NSMutableArray array];
+    for (id gadget in gadgets) {
+        NSString *name = NSStringFromClass([gadget class]);
+        if (![classes containsObject:name]) {
+            [classes addObject:name];
+        }
+        if (albumGadgetClass != Nil && [gadget isKindOfClass:albumGadgetClass]) {
+            hasAlbumGadget = YES;
+        }
+    }
+    if (!hasAlbumGadget && classes.count == 0) {
+        return;
+    }
+    NSString *line = [NSString stringWithFormat:@"%@ [%lu] %@",
+                      NSStringFromClass([self class]), (unsigned long)gadgets.count,
+                      [classes componentsJoinedByString:@","]];
+    NSMutableArray *lines = [NSMutableArray array];
+    NSArray *existing = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("providerDump"),
+                                                                   (__bridge CFStringRef)@APELIN_PACKAGE_ID));
+    if ([existing isKindOfClass:[NSArray class]]) {
+        [lines addObjectsFromArray:existing];
+    }
+    if (![lines containsObject:line]) {
+        [lines addObject:line];
+    }
+    CFPreferencesSetAppValue(CFSTR("providerDump"), (__bridge CFPropertyListRef)lines,
+                             (__bridge CFStringRef)@APELIN_PACKAGE_ID);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
 }
 
 static id HookedGadgetForIndexPath(id self, SEL _cmd, NSIndexPath *indexPath) {
@@ -538,7 +634,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
 
     if (albumsProvider != Nil &&
         class_getInstanceMethod(albumsProvider, @selector(gadgetForIndexPath:)) != NULL) {
-        MSHookMessageEx(albumsProvider, @selector(gadgetForIndexPath:),
-                        (IMP)HookedGadgetForIndexPath, (IMP *)&OriginalGadgetForIndexPath);
+        // Left unhooked on purpose: the list reads its cells from `gadgets` by
+        // position, so translating the index again would shift every card.
     }
 }
