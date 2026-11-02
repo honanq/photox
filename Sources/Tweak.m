@@ -421,6 +421,17 @@ static id HookedInitWithAlbumsGadgetProvider(id self, SEL _cmd, id provider) {
     return result;
 }
 
+static void (*OriginalReconfigureGadgets)(id, SEL);
+
+static void HookedReconfigureGadgets(id self, SEL _cmd) {
+    OriginalReconfigureGadgets(self, _cmd);
+    @try {
+        FilterAlbumListGadgetArrays(self);
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+}
+
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
     if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
         MSHookMessageEx(cls, selector, hook, original);
@@ -496,5 +507,12 @@ __attribute__((constructor)) static void TweakInitialize(void) {
         MSHookMessageEx(albumListClass, @selector(initWithAlbumsGadgetProvider:),
                         (IMP)HookedInitWithAlbumsGadgetProvider,
                         (IMP *)&OriginalInitWithAlbumsGadgetProvider);
+    }
+
+    Class providerClass = objc_getClass("PUAlbumsGadgetProvider");
+    if (providerClass != Nil &&
+        class_getInstanceMethod(providerClass, @selector(_reconfigureGadgets)) != NULL) {
+        MSHookMessageEx(providerClass, @selector(_reconfigureGadgets),
+                        (IMP)HookedReconfigureGadgets, (IMP *)&OriginalReconfigureGadgets);
     }
 }
