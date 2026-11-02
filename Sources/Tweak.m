@@ -101,6 +101,9 @@ static void FileLog(NSString *format, ...) {
 // bundle's Root.plist stores to and posts the change notification on.
 static BOOL gEnabled = YES;
 static BOOL gLoaded = NO;
+// Whether Photos' own Face ID for the hidden album has been passed in this
+// session: the album reads as empty only after it has.
+static BOOL gAuthenticated = NO;
 
 static BOOL ReadEnabledFromPreferences(void) {
     NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
@@ -159,6 +162,15 @@ static void StartListeningForSettingChanges(void) {
                                         (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/changed"),
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
+        // Leaving Photos must ask again next time the album is opened.
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidEnterBackgroundNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+            (void)note;
+            gAuthenticated = NO;
+        }];
         // Coming back from Settings is the moment the value can differ.
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidBecomeActiveNotification
@@ -293,7 +305,6 @@ static BOOL DataSourceIsHiddenAlbum(id dataSource) {
 // no items before, and reads as empty afterwards, which is what makes Photos
 // draw "无照片或视频".
 static char kAskedFaceIDKey __attribute__((unused));
-static BOOL gAuthenticated = NO;
 static UIViewController *TopViewController(void) {
     UIWindow *keyWindow = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -353,38 +364,59 @@ static void RefreshAlbumViews(void) {
     });
 }
 
-// Photos asks for Face ID itself when the album is opened; asking a second
-// time here only got our own request cancelled by Photos' one. So watch the
-// result of Photos' own request instead: the album stays blank until it passes.
+// Photos asks for Face ID itself when the album is opened, and asks nothing
+// once the album reads as empty. So before the pass nothing is touched at all:
+// Photos runs its own flow. Only after Photos' own Face ID succeeds does the
+// album read as empty, which is what makes Photos draw "无照片或视频".
 typedef void (^HiddenAlbumAuthReply)(BOOL success, NSError *error);
-static void (*OriginalEvaluatePolicy)(id, SEL, LAPolicy, NSString *, HiddenAlbumAuthReply);
+static void (*OriginalEvaluatePolicyReason)(id, SEL, LAPolicy, NSString *, HiddenAlbumAuthReply);
+static void (*OriginalEvaluatePolicyOptions)(id, SEL, LAPolicy, NSDictionary *, HiddenAlbumAuthReply);
 
-static void HookedEvaluatePolicy(id self, SEL _cmd, LAPolicy policy, NSString *reason,
-                                 HiddenAlbumAuthReply reply) {
-    FileLog(@"lauth policy=%ld reason=%@", (long)policy, reason);
+static void HandleAuthenticationResult(BOOL success, NSError *error, NSString *source) {
+    FileLog(@"lauth %@ success=%d error=%@", source, success ? 1 : 0, error.localizedDescription);
+    if (!success) {
+        return;
+    }
+    gAuthenticated = YES;
+    RefreshAlbumViews();
+}
+
+static void HookedEvaluatePolicyReason(id self, SEL _cmd, LAPolicy policy, NSString *reason,
+                                       HiddenAlbumAuthReply reply) {
     HiddenAlbumAuthReply wrapped = ^(BOOL success, NSError *error) {
-        FileLog(@"lauth done success=%d error=%@", success ? 1 : 0, error.localizedDescription);
-        if (success) {
-            gAuthenticated = YES;
-            RefreshAlbumViews();
-        }
+        HandleAuthenticationResult(success, error, @"reason");
         if (reply != nil) {
             reply(success, error);
         }
     };
-    if (OriginalEvaluatePolicy != NULL) {
-        OriginalEvaluatePolicy(self, _cmd, policy, reason, wrapped);
+    if (OriginalEvaluatePolicyReason != NULL) {
+        OriginalEvaluatePolicyReason(self, _cmd, policy, reason, wrapped);
+    } else if (reply != nil) {
+        reply(NO, nil);
+    }
+}
+
+static void HookedEvaluatePolicyOptions(id self, SEL _cmd, LAPolicy policy, NSDictionary *options,
+                                        HiddenAlbumAuthReply reply) {
+    HiddenAlbumAuthReply wrapped = ^(BOOL success, NSError *error) {
+        HandleAuthenticationResult(success, error, @"options");
+        if (reply != nil) {
+            reply(success, error);
+        }
+    };
+    if (OriginalEvaluatePolicyOptions != NULL) {
+        OriginalEvaluatePolicyOptions(self, _cmd, policy, options, wrapped);
     } else if (reply != nil) {
         reply(NO, nil);
     }
 }
 
 static void RequestFaceIDForHiddenAlbum(id dataSource) {
-    // A different data source means the album was opened again: ask again.
+    // Only records the album's data source; nothing is asked and nothing hidden
+    // until Photos' own Face ID for it has been passed.
     static __unsafe_unretained id lastDataSource = nil;
     if (dataSource != lastDataSource) {
         lastDataSource = dataSource;
-        gAuthenticated = NO;
     }
 }
 
@@ -396,7 +428,7 @@ static long HookedNumberOfItemsInSection(id self, SEL _cmd, long section) {
                         : 0;
     if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
         RequestFaceIDForHiddenAlbum(self);
-        return 0;  // No items before Face ID: the page stays blank.
+        return gAuthenticated ? 0 : original;  // untouched until Photos' Face ID passes
     }
     return original;
 }
@@ -434,13 +466,21 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     }
 
     Class laContext = objc_getClass("LAContext");
-    if (laContext != Nil &&
-        class_getInstanceMethod(laContext, @selector(evaluatePolicy:localizedReason:reply:)) != NULL) {
-        MSHookMessageEx(laContext,
-                        @selector(evaluatePolicy:localizedReason:reply:),
-                        (IMP)HookedEvaluatePolicy,
-                        (IMP *)&OriginalEvaluatePolicy);
-        FileLog(@"hooked -[LAContext evaluatePolicy:localizedReason:reply:]");
+    if (laContext != Nil) {
+        if (class_getInstanceMethod(laContext, @selector(evaluatePolicy:localizedReason:reply:)) != NULL) {
+            MSHookMessageEx(laContext,
+                            @selector(evaluatePolicy:localizedReason:reply:),
+                            (IMP)HookedEvaluatePolicyReason,
+                            (IMP *)&OriginalEvaluatePolicyReason);
+            FileLog(@"hooked -[LAContext evaluatePolicy:localizedReason:reply:]");
+        }
+        if (class_getInstanceMethod(laContext, @selector(evaluatePolicy:options:reply:)) != NULL) {
+            MSHookMessageEx(laContext,
+                            @selector(evaluatePolicy:options:reply:),
+                            (IMP)HookedEvaluatePolicyOptions,
+                            (IMP *)&OriginalEvaluatePolicyOptions);
+            FileLog(@"hooked -[LAContext evaluatePolicy:options:reply:]");
+        }
     }
 
     Class photosDataSource = objc_getClass("PXPhotosDataSource");
