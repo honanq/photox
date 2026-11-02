@@ -477,24 +477,33 @@ static UIAlertAction *DeleteActionInAlert(UIAlertController *alert) {
     if (offersRemoveFromAlbum) {
         return delete;
     }
-    NSString *message = alert.message ?: @"";
-    NSString *lowercaseMessage = [message lowercaseString];
-    BOOL mentionsPhoto = [message containsString:@"照片"] ||
-                         [lowercaseMessage containsString:@"photo"];
-    BOOL mentionsDelete = [message containsString:@"删除"] ||
-                          [lowercaseMessage containsString:@"delete"];
+    NSString *text = [NSString stringWithFormat:@"%@ %@", alert.title ?: @"", alert.message ?: @""];
+    NSString *lowercaseText = [text lowercaseString];
+    BOOL mentionsPhoto = [text containsString:@"照片"] ||
+                         [lowercaseText containsString:@"photo"];
+    BOOL mentionsDelete = [text containsString:@"删除"] ||
+                          [lowercaseText containsString:@"delete"];
     if (choices == 1 && mentionsPhoto && mentionsDelete) {
         return delete;
     }
     return nil;
 }
 
-// Only this app's own alerts are considered: the tweak is injected into Photos
-// alone, and the two shapes matched by DeleteActionInAlert are specific enough
-// that another alert in this app cannot be mistaken for them.
+// The viewer that asks before deleting: -[PUOneUpViewController ...] presents the
+// confirmation, which is how this tweak tells it apart from any other alert.
+static BOOL PresenterIsOneUp(id presenter) {
+    for (Class cls = [presenter class]; cls != Nil; cls = class_getSuperclass(cls)) {
+        if ([NSStringFromClass(cls) containsString:@"OneUp"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static void HookedPresentViewController(id self, SEL _cmd, UIViewController *viewController,
                                         BOOL animated, void (^completion)(void)) {
-    if (gQuickDelete && [viewController isKindOfClass:[UIAlertController class]]) {
+    if (gQuickDelete && [viewController isKindOfClass:[UIAlertController class]] &&
+        PresenterIsOneUp(self)) {
         UIAlertAction *delete = DeleteActionInAlert((UIAlertController *)viewController);
         if (delete != nil) {
             void (^handler)(UIAlertAction *) = nil;
@@ -526,7 +535,7 @@ static void HookedAlertViewDidAppear(id self, SEL _cmd, BOOL animated) {
         return;
     }
     UIAlertAction *delete = DeleteActionInAlert((UIAlertController *)self);
-    if (delete == nil) {
+    if (delete == nil || !PresenterIsOneUp([(UIViewController *)self presentingViewController])) {
         return;
     }
     void (^handler)(UIAlertAction *) = nil;
