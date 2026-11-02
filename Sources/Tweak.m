@@ -295,10 +295,72 @@ static BOOL DataSourceIsHiddenAlbum(id dataSource) {
 }
 
 // The album is empty for us, so Photos no longer asks for Face ID before
-// showing it. Ask once per visit, the way Photos asks for its contents.
+// showing it. Ask once per visit, and only show the empty state once the
+// person passed it: until then the grid stays blank.
 static char kAskedFaceIDKey;
+static __weak id gHiddenDataSource = nil;
+static BOOL gHiddenAlbumAuthenticated = NO;
+static BOOL gDumpedMethods = NO;
+
+// Any change here must make Photos ask for the counts again, or the grid keeps
+// what it last drew.
+static void ForceDataSourceRefresh(id dataSource) {
+    if (dataSource == nil) {
+        return;
+    }
+    for (NSString *name in @[@"setNeedsUpdate", @"updateIfNeeded", @"reloadData",
+                             @"invalidateLayout"]) {
+        SEL selector = NSSelectorFromString(name);
+        if (![dataSource respondsToSelector:selector]) {
+            continue;
+        }
+        @try {
+            NSMethodSignature *signature = [dataSource methodSignatureForSelector:selector];
+            if (signature != nil && signature.numberOfArguments == 2) {
+                NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+                invocation.target = dataSource;
+                invocation.selector = selector;
+                [invocation invoke];
+                FileLog(@"refresh %@ via %@", NSStringFromClass([dataSource class]), name);
+                return;
+            }
+        } @catch (NSException *exception) {
+            FileLog(@"refresh %@ threw: %@", name, exception.reason);
+        }
+    }
+    FileLog(@"refresh %@: no selector worked", NSStringFromClass([dataSource class]));
+}
+
+// Diagnostic: which methods could refresh the grid, for the next build.
+static void DumpDataSourceMethodsOnce(id dataSource) {
+    if (gDumpedMethods) {
+        return;
+    }
+    gDumpedMethods = YES;
+    NSMutableString *names = [NSMutableString string];
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList([dataSource class], &count);
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[i]));
+        if ([name rangeOfString:@"update"].location != NSNotFound ||
+            [name rangeOfString:@"reload"].location != NSNotFound ||
+            [name rangeOfString:@"change"].location != NSNotFound) {
+            [names appendFormat:@" %@", name];
+        }
+    }
+    free(methods);
+    FileLog(@"methods %@:%@", NSStringFromClass([dataSource class]), names);
+}
 
 static void RequestFaceIDForHiddenAlbum(id dataSource) {
+    // A different data source means the album was opened again: ask again.
+    static __unsafe_unretained id lastDataSource = nil;
+    if (dataSource != lastDataSource) {
+        lastDataSource = dataSource;
+        gHiddenAlbumAuthenticated = NO;
+    }
+    gHiddenDataSource = dataSource;
+    DumpDataSourceMethodsOnce(dataSource);
     if (objc_getAssociatedObject(dataSource, &kAskedFaceIDKey) != nil) {
         return;
     }
@@ -315,6 +377,13 @@ static void RequestFaceIDForHiddenAlbum(id dataSource) {
                 localizedReason:@"查看「已隐藏」相簿"
                           reply:^(BOOL success, NSError *authError) {
             FileLog(@"faceid success=%d error=%@", success ? 1 : 0, authError.localizedDescription);
+            if (!success) {
+                return;
+            }
+            gHiddenAlbumAuthenticated = YES;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ForceDataSourceRefresh(gHiddenDataSource);
+            });
         }];
     });
 }
@@ -347,10 +416,13 @@ static long HookedNumberOfSections(id self, SEL _cmd) {
         static NSInteger logged = 0;
         if (logged < 10) {
             logged++;
-            FileLog(@"grid %@ numberOfSections orig=%ld -> 0",
-                    NSStringFromClass([self class]), original);
+            FileLog(@"grid %@ numberOfSections orig=%ld authenticated=%d",
+                    NSStringFromClass([self class]), original, gHiddenAlbumAuthenticated ? 1 : 0);
         }
-        return 0;
+        // Before the person passed Face ID the section stays (with no items,
+        // so nothing shows); afterwards the album reads as empty and Photos
+        // draws its own "无照片或视频".
+        return gHiddenAlbumAuthenticated ? 0 : original;
     }
     return original;
 }
