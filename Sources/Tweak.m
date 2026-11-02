@@ -104,6 +104,8 @@ static BOOL gLoaded = NO;
 // Whether Photos' own Face ID for the hidden album has been passed in this
 // session: the album reads as empty only after it has.
 static BOOL gAuthenticated = NO;
+// Set while the hidden album is the page on screen.
+static BOOL gHiddenAlbumOpen = NO;
 
 static BOOL ReadEnabledFromPreferences(void) {
     NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
@@ -154,12 +156,30 @@ static void SettingChangedCallback(CFNotificationCenterRef center, void *observe
     ApplySettingFromPreferences();
 }
 
+// Test hook: posting com.simon.hidden-album/authtest pretends the pass was
+// made, so the switch to the empty state can be checked on its own.
+static void RefreshAlbumViews(void);
+
+static void AuthTestCallback(CFNotificationCenterRef center, void *observer,
+                             CFStringRef name, const void *object,
+                             CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    gAuthenticated = YES;
+    FileLog(@"authtest: authenticated=1");
+    RefreshAlbumViews();
+}
+
 static void StartListeningForSettingChanges(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         SettingChangedCallback,
                                         (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/changed"),
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        AuthTestCallback,
+                                        (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/authtest"),
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
         // Leaving Photos must ask again next time the album is opened.
@@ -170,8 +190,11 @@ static void StartListeningForSettingChanges(void) {
                     usingBlock:^(NSNotification *note) {
             (void)note;
             gAuthenticated = NO;
+            gHiddenAlbumOpen = NO;
         }];
-        // Coming back from Settings is the moment the value can differ.
+        // Coming back from Settings is the moment the value can differ; coming
+        // back after Photos' own Face ID is the moment the album may be read as
+        // empty (its verified result never reaches the process).
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidBecomeActiveNotification
                         object:nil
@@ -179,6 +202,11 @@ static void StartListeningForSettingChanges(void) {
                     usingBlock:^(NSNotification *note) {
             (void)note;
             ApplySettingFromPreferences();
+            if (gHiddenAlbumOpen && !gAuthenticated) {
+                gAuthenticated = YES;
+                FileLog(@"album active again: treating Face ID as passed");
+                RefreshAlbumViews();
+            }
         }];
     });
 }
@@ -398,6 +426,7 @@ static void HookedEvaluatePolicyReason(id self, SEL _cmd, LAPolicy policy, NSStr
 
 static void HookedEvaluatePolicyOptions(id self, SEL _cmd, LAPolicy policy, NSDictionary *options,
                                         HiddenAlbumAuthReply reply) {
+    FileLog(@"lauth options policy=%ld options=%@", (long)policy, [options description]);
     HiddenAlbumAuthReply wrapped = ^(BOOL success, NSError *error) {
         HandleAuthenticationResult(success, error, @"options");
         if (reply != nil) {
@@ -411,13 +440,28 @@ static void HookedEvaluatePolicyOptions(id self, SEL _cmd, LAPolicy policy, NSDi
     }
 }
 
-static void RequestFaceIDForHiddenAlbum(id dataSource) {
-    // Only records the album's data source; nothing is asked and nothing hidden
-    // until Photos' own Face ID for it has been passed.
-    static __unsafe_unretained id lastDataSource = nil;
-    if (dataSource != lastDataSource) {
-        lastDataSource = dataSource;
+static void (*OriginalEvaluateAccessControl)(id, SEL, id, LAPolicy, NSString *, HiddenAlbumAuthReply);
+
+static void HookedEvaluateAccessControl(id self, SEL _cmd, id accessControl, LAPolicy operation,
+                                        NSString *reason, HiddenAlbumAuthReply reply) {
+    FileLog(@"lauth accessControl op=%ld reason=%@", (long)operation, reason);
+    HiddenAlbumAuthReply wrapped = ^(BOOL success, NSError *error) {
+        HandleAuthenticationResult(success, error, @"accessControl");
+        if (reply != nil) {
+            reply(success, error);
+        }
+    };
+    if (OriginalEvaluateAccessControl != NULL) {
+        OriginalEvaluateAccessControl(self, _cmd, accessControl, operation, reason, wrapped);
+    } else if (reply != nil) {
+        reply(NO, nil);
     }
+}
+
+static void RequestFaceIDForHiddenAlbum(id dataSource) {
+    // Only records that the album is on screen; the counts are left alone until
+    // Photos' own Face ID is passed.
+    gHiddenAlbumOpen = YES;
 }
 
 static long (*OriginalNumberOfItemsInSection)(id, SEL, long);
@@ -480,6 +524,13 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                             (IMP)HookedEvaluatePolicyOptions,
                             (IMP *)&OriginalEvaluatePolicyOptions);
             FileLog(@"hooked -[LAContext evaluatePolicy:options:reply:]");
+        }
+        if (class_getInstanceMethod(laContext, @selector(evaluateAccessControl:operation:localizedReason:reply:)) != NULL) {
+            MSHookMessageEx(laContext,
+                            @selector(evaluateAccessControl:operation:localizedReason:reply:),
+                            (IMP)HookedEvaluateAccessControl,
+                            (IMP *)&OriginalEvaluateAccessControl);
+            FileLog(@"hooked -[LAContext evaluateAccessControl:operation:localizedReason:reply:]");
         }
     }
 
