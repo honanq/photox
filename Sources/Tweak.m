@@ -447,41 +447,67 @@ static BOOL TitleMentionsAlbum(NSString *title) {
 }
 
 static BOOL TitleIsDelete(NSString *title) {
-    return [title isEqualToString:@"删除"] ||
-           [title caseInsensitiveCompare:@"delete"] == NSOrderedSame;
+    return [title containsString:@"删除"] ||
+           [title rangeOfString:@"delete" options:NSCaseInsensitiveSearch].location == 0;
 }
 
-// The 删除 action of that sheet, or nil when this alert is something else: the
-// sheet is recognised by its destructive 删除 next to a 从相簿中移除 entry.
-static UIAlertAction *DeleteActionInSheet(UIAlertController *sheet) {
+// The 删除 action of the viewer's sheet, or the one on the system's own
+// confirmation that follows it ("此照片将从图库中删除。它将在“最近删除”中保留 30 天。"),
+// or nil when this alert is something else. Two shapes are recognised:
+//   从相簿中移除 / 删除 / 取消        — the sheet the trash button shows
+//   message mentioning 最近删除 + 删除照片 / 取消 — the confirmation behind it
+static UIAlertAction *DeleteActionInAlert(UIAlertController *alert) {
     UIAlertAction *delete = nil;
     BOOL offersRemoveFromAlbum = NO;
-    for (UIAlertAction *action in sheet.actions) {
+    NSUInteger choices = 0;
+    for (UIAlertAction *action in alert.actions) {
         if (action.style == UIAlertActionStyleDestructive) {
             delete = action;
         } else if (action.style != UIAlertActionStyleCancel &&
                    TitleMentionsAlbum(action.title ?: @"")) {
             offersRemoveFromAlbum = YES;
         }
+        if (action.style != UIAlertActionStyleCancel) {
+            choices++;
+        }
     }
-    if (delete == nil || !offersRemoveFromAlbum || !TitleIsDelete(delete.title ?: @"")) {
+    if (delete == nil || !TitleIsDelete(delete.title ?: @"")) {
         return nil;
     }
-    return delete;
+    if (offersRemoveFromAlbum) {
+        return delete;
+    }
+    NSString *message = alert.message ?: @"";
+    BOOL mentionsRecentlyDeleted =
+        [message containsString:@"最近删除"] ||
+        [message rangeOfString:@"recently deleted" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    if (choices == 1 && mentionsRecentlyDeleted) {
+        return delete;
+    }
+    return nil;
 }
 
-// Only Photos asks this, so the presenter has to be one of its view controllers.
+// Only Photos asks this, so the presenter has to belong to Photos: the tweak is
+// injected into that one app, and the class check keeps other frameworks' alerts
+// (share sheets and the like) untouched.
 static BOOL PresenterIsPhotos(id presenter) {
+    if (presenter == nil) {
+        return NO;
+    }
+    NSString *bundle = [NSBundle bundleForClass:[presenter class]].bundleIdentifier;
+    if ([bundle isEqualToString:@"com.apple.mobileslideshow"] ||
+        [bundle hasPrefix:@"com.apple.Photos"]) {
+        return YES;
+    }
     NSString *name = NSStringFromClass([presenter class]);
-    return [name hasPrefix:@"PU"] || [name hasPrefix:@"PX"] ||
-           [name containsString:@"Photo"];
+    return [name hasPrefix:@"PU"] || [name hasPrefix:@"PX"] || [name containsString:@"Photo"];
 }
 
 static void HookedPresentViewController(id self, SEL _cmd, UIViewController *viewController,
                                         BOOL animated, void (^completion)(void)) {
     if (gQuickDelete && [viewController isKindOfClass:[UIAlertController class]] &&
         PresenterIsPhotos(self)) {
-        UIAlertAction *delete = DeleteActionInSheet((UIAlertController *)viewController);
+        UIAlertAction *delete = DeleteActionInAlert((UIAlertController *)viewController);
         if (delete != nil) {
             void (^handler)(UIAlertAction *) = nil;
             @try {
