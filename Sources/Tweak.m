@@ -115,33 +115,39 @@ static BOOL ReadEnabledFromPreferences(void) {
 }
 
 static BOOL HiddenContentsEnabled(void) {
-    if (!gLoaded) {
-        gEnabled = ReadEnabledFromPreferences();
+    // Re-read at most twice a second: the pane's notification was not seen to
+    // reach the process, and a stale value would keep the setting stuck until
+    // the app restarts.
+    static CFAbsoluteTime lastRead = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!gLoaded || now - lastRead > 0.5) {
+        BOOL enabled = ReadEnabledFromPreferences();
+        if (!gLoaded || enabled != gEnabled) {
+            FileLog(@"setting %@ enabled=%d", gLoaded ? @"changed" : @"read", enabled ? 1 : 0);
+        }
+        gEnabled = enabled;
         gLoaded = YES;
-        FileLog(@"setting enabled=%d", gEnabled ? 1 : 0);
+        lastRead = now;
     }
     return gEnabled;
 }
 
-// The pane posts <package id>/changed; re-read the value on the next call.
-static void SettingChanged(void) {
-    BOOL enabled = ReadEnabledFromPreferences();
-    gEnabled = enabled;
-    gLoaded = YES;
-    FileLog(@"setting changed enabled=%d", enabled ? 1 : 0);
+// The pane posts <package id>/changed on the Darwin notification center.
+static void SettingChangedCallback(CFNotificationCenterRef center, void *observer,
+                                   CFStringRef name, const void *object,
+                                   CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    gLoaded = NO;
 }
 
 static void StartListeningForSettingChanges(void) {
-    static int token = -1;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        notify_register_dispatch(APELIN_PACKAGE_ID "/changed",
-                                 &token,
-                                 dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
-                                 ^(int t) {
-            (void)t;
-            SettingChanged();
-        });
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        SettingChangedCallback,
+                                        (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/changed"),
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
     });
 }
 
