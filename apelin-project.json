@@ -163,7 +163,7 @@
   "package": {
     "id": "com.simon.hidden-album",
     "name": "隐藏相册隐藏",
-    "version": "0.0.1",
+    "version": "0.1.0",
     "description": "把照片 App「已隐藏」相簿内容隐藏为空并显示“无照片或视频”，带偏好设置开关。",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "Simon",

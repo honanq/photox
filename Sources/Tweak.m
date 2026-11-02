@@ -125,12 +125,33 @@ static long HookedNumberOfSections(id self, SEL _cmd) {
 #pragma mark - 人物与地点 in the Albums tab
 
 // The Albums tab is a gadget collection view: PUAlbumsGadgetViewController (a
-// PXGadgetUIViewController) lists gadgets one section each, and the "人物与地点"
-// section is the gadget whose class says People or Places. With no items and no
-// header, the block and its title are both gone.
+// PXGadgetUIViewController) lists gadgets one section each, titled "我的相簿",
+// "人物与地点", "媒体类型" and so on. The section whose gadget is titled People &
+// Places gets no items and no header, so the block and its title are both gone.
 @interface PXGadgetUIViewController : UIViewController
 - (id)_gadgetAtIndexPath:(NSIndexPath *)indexPath;
 @end
+
+static BOOL GadgetIsPeopleAndPlaces(id gadget) {
+    NSString *title = nil;
+    @try {
+        id value = [gadget valueForKey:@"title"];
+        if (value == nil) {
+            value = [gadget valueForKey:@"localizedTitle"];
+        }
+        title = [value description];
+    } @catch (NSException *exception) {
+        return NO;
+    }
+    if (title.length == 0) {
+        return NO;
+    }
+    BOOL people = [title containsString:@"人物"] ||
+                  [title rangeOfString:@"people" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    BOOL places = [title containsString:@"地点"] ||
+                  [title rangeOfString:@"place" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    return people && places;
+}
 
 static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section) {
     id gadget = nil;
@@ -140,11 +161,7 @@ static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section) {
     } @catch (NSException *exception) {
         (void)exception;
     }
-    if (gadget == nil) {
-        return NO;
-    }
-    NSString *name = NSStringFromClass([gadget class]);
-    return [name containsString:@"People"] || [name containsString:@"Place"];
+    return gadget != nil && GadgetIsPeopleAndPlaces(gadget);
 }
 
 static NSInteger (*OriginalGadgetNumberOfItems)(id, SEL, UICollectionView *, NSInteger);
