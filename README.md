@@ -14,6 +14,8 @@
 2. **隐藏「人物与地点」**：相簿页中的「人物与地点」整组连同标题一起不显示。
 3. **按相簿隐藏**：在设置里逐个勾选「我的相簿」中要隐藏的相簿（含「最近项目」「个人收藏」
    等智能相簿），勾选后该卡片从相簿页消失，后面的卡片自动补位。
+4. **删除时不再询问**（默认关闭）：开启后，查看照片时点删除按钮直接删除，不再弹
+   「从相簿中移除 / 删除 / 取消」。删除的照片仍在「最近删除」里，可照常恢复。
 
 开关改动后照片 App 会自动重启一次以生效；相簿清单需要先打开一次照片的「相簿」页才会刷新。
 
@@ -28,6 +30,7 @@
 | `-[PXGadgetUIViewController collectionView:layout:referenceSizeForHeaderInSection:]` | 该段标题高度归零 |
 | `-[PUAlbumsGadgetProvider gadgets]` | 读取相簿清单，写入设置页读取的偏好域 |
 | `-[PUDoubleHeightHorizontalAlbumListGadgetLayout layoutAttributesForItemAtIndexPath:]` | 隐藏指定相簿的卡片，并按可见序号重排 |
+| `-[UIViewController presentViewController:animated:completion:]` | 「删除时不再询问」：命中照片查看器的删除确认弹窗时，直接执行其中的「删除」动作而不弹出 |
 
 相簿可见性只扫描一次并缓存在 provider 上（设置变更或相簿数量变化才重建），
 布局回调只做数组查表；没有轮询、没有定时刷新、没有日志输出。

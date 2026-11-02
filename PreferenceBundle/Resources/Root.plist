@@ -68,6 +68,28 @@
 			<key>isController</key>
 			<true/>
 		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>查看照片</string>
+			<key>footerText</key>
+			<string>开启后，查看照片时点删除按钮会直接删除，不再询问「从相簿中移除」还是「删除」。删除的照片仍在「最近删除」中，可从此恢复。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>删除时不再询问</string>
+			<key>key</key>
+			<string>quickDelete</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.simon.hidden-album</string>
+			<key>PostNotification</key>
+			<string>com.simon.hidden-album/changed</string>
+		</dict>
 	</array>
 </dict>
 </plist>

@@ -29,6 +29,7 @@
 // the app comes back to the front. Nothing polls.
 static BOOL gHideHiddenAlbum = YES;
 static BOOL gHidePeopleAndPlaces = YES;
+static BOOL gQuickDelete = NO;
 static BOOL gLoaded = NO;
 static int gSettingsGeneration = 0;
 static NSDictionary<NSString *, NSNumber *> *gHiddenAlbumFlags = nil;
@@ -79,6 +80,7 @@ static void ReadSettings(void) {
     }
     gHideHiddenAlbum = album;
     gHidePeopleAndPlaces = peopleAndPlaces;
+    gQuickDelete = BoolFromPreferences(@"quickDelete", NO);
     gHiddenAlbumFlags = nil;  // per-album switches are re-read on next use
     gSettingsGeneration++;    // and every cached album list with them
     gLoaded = YES;
@@ -432,6 +434,73 @@ static UICollectionViewLayoutAttributes *HookedAlbumLayoutItem(id self, SEL _cmd
     return attributes;
 }
 
+#pragma mark - Deleting a photo without the question
+
+// The viewer's trash button shows an action sheet: 从相簿中移除 / 删除 / 取消. With
+// the switch on the sheet is not presented at all and its 删除 action runs
+// straight away; the photo still lands in 最近删除, as any delete does.
+static BOOL (*OriginalPresentViewController)(id, SEL, UIViewController *, BOOL, void (^)(void));
+
+static BOOL TitleMentionsAlbum(NSString *title) {
+    return [title containsString:@"相簿"] ||
+           [title rangeOfString:@"album" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static BOOL TitleIsDelete(NSString *title) {
+    return [title isEqualToString:@"删除"] ||
+           [title caseInsensitiveCompare:@"delete"] == NSOrderedSame;
+}
+
+// The 删除 action of that sheet, or nil when this alert is something else: the
+// sheet is recognised by its destructive 删除 next to a 从相簿中移除 entry.
+static UIAlertAction *DeleteActionInSheet(UIAlertController *sheet) {
+    UIAlertAction *delete = nil;
+    BOOL offersRemoveFromAlbum = NO;
+    for (UIAlertAction *action in sheet.actions) {
+        if (action.style == UIAlertActionStyleDestructive) {
+            delete = action;
+        } else if (action.style != UIAlertActionStyleCancel &&
+                   TitleMentionsAlbum(action.title ?: @"")) {
+            offersRemoveFromAlbum = YES;
+        }
+    }
+    if (delete == nil || !offersRemoveFromAlbum || !TitleIsDelete(delete.title ?: @"")) {
+        return nil;
+    }
+    return delete;
+}
+
+// Only Photos asks this, so the presenter has to be one of its view controllers.
+static BOOL PresenterIsPhotos(id presenter) {
+    NSString *name = NSStringFromClass([presenter class]);
+    return [name hasPrefix:@"PU"] || [name hasPrefix:@"PX"] ||
+           [name containsString:@"Photo"];
+}
+
+static void HookedPresentViewController(id self, SEL _cmd, UIViewController *viewController,
+                                        BOOL animated, void (^completion)(void)) {
+    if (gQuickDelete && [viewController isKindOfClass:[UIAlertController class]] &&
+        PresenterIsPhotos(self)) {
+        UIAlertAction *delete = DeleteActionInSheet((UIAlertController *)viewController);
+        if (delete != nil) {
+            void (^handler)(UIAlertAction *) = nil;
+            @try {
+                handler = [delete valueForKey:@"handler"];
+            } @catch (NSException *exception) {
+                (void)exception;
+            }
+            if (handler != nil) {
+                handler(delete);
+                if (completion != nil) {
+                    completion();
+                }
+                return;
+            }
+        }
+    }
+    OriginalPresentViewController(self, _cmd, viewController, animated, completion);
+}
+
 #pragma mark - Hooks
 
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
@@ -475,4 +544,8 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     HookSelector(objc_getClass("PUDoubleHeightHorizontalAlbumListGadgetLayout"),
                  @selector(layoutAttributesForItemAtIndexPath:),
                  (IMP)HookedAlbumLayoutItem, (IMP *)&OriginalAlbumLayoutItem);
+
+    HookSelector(objc_getClass("UIViewController"),
+                 @selector(presentViewController:animated:completion:),
+                 (IMP)HookedPresentViewController, (IMP *)&OriginalPresentViewController);
 }
