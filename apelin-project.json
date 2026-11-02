@@ -1,0 +1,197 @@
+{
+  "schemaVersion": 1,
+  "projectID": "b8f985ba-3576-4395-8de0-3646efc6d603",
+  "kind": "tweak",
+  "template": {
+    "extensionID": "wiki.qaq.apelin.dev.tweak",
+    "templateID": "objc-hook",
+    "version": "0.1.1",
+    "digest": "sha256:f7aa0129fcb88ba57ea493d55f34828fd0bc1a435e5a0e3145dedf16118d4dc6"
+  },
+  "environment": {
+    "toolchain": {
+      "id": "67525fd44741f8a0f7d7b2e7",
+      "digest": "sha256:76823e840b327ed36e2828a7a28fc42e8fc6124d1c480d621403f595d3fd5144"
+    },
+    "sdk": {
+      "id": "iphoneos18.5-aa05f66b",
+      "digest": "sha256:aa05f66b4ada374e533a8bb82ed3f21d4348d3d1677a52cd024f8fb891231433"
+    }
+  },
+  "language": "objc",
+  "deploymentTarget": "16.0",
+  "architectures": {
+    "rootless": [
+      "arm64",
+      "arm64e"
+    ],
+    "roothide": [
+      "arm64e"
+    ]
+  },
+  "configurations": {
+    "Debug": {
+      "optimization": "0",
+      "debugInfo": true,
+      "defines": {
+        "DEBUG": "1"
+      }
+    },
+    "Release": {
+      "optimization": "2",
+      "debugInfo": true
+    }
+  },
+  "products": [
+    {
+      "id": "tweak",
+      "type": "dylib",
+      "name": "HiddenAlbum",
+      "sources": [
+        "Sources/*.m"
+      ],
+      "headerSearchPaths": [
+        "Sources"
+      ],
+      "objcARC": true,
+      "frameworks": [
+        "Foundation",
+        "UIKit",
+        "Photos"
+      ],
+      "libraries": [
+        "substrate"
+      ],
+      "extensionSupport": [
+        {
+          "extension": "wiki.qaq.apelin.dev.tweak",
+          "component": "substrate"
+        }
+      ]
+    },
+    {
+      "id": "prefs",
+      "type": "bundle",
+      "name": "HiddenAlbumSettings",
+      "sources": [
+        "PreferenceBundle/Sources/*.m"
+      ],
+      "headerSearchPaths": [
+        "PreferenceBundle/Sources"
+      ],
+      "resources": [
+        "PreferenceBundle/Resources/Root.plist",
+        "PreferenceBundle/Resources/icon.png",
+        "PreferenceBundle/Resources/icon@2x.png",
+        "PreferenceBundle/Resources/icon@3x.png"
+      ],
+      "infoPlist": "PreferenceBundle/Resources/Info.plist",
+      "objcARC": true,
+      "frameworks": [
+        "Foundation",
+        "UIKit",
+        "Preferences"
+      ],
+      "extensionSupport": [
+        {
+          "extension": "wiki.qaq.apelin.dev.preferences",
+          "component": "preferences"
+        }
+      ]
+    }
+  ],
+  "build": {
+    "steps": [
+      {
+        "type": "compile",
+        "product": "tweak"
+      },
+      {
+        "type": "link",
+        "product": "tweak"
+      },
+      {
+        "type": "lipo",
+        "product": "tweak"
+      },
+      {
+        "type": "dsym",
+        "product": "tweak"
+      },
+      {
+        "type": "strip",
+        "product": "tweak",
+        "style": "non-global"
+      },
+      {
+        "type": "sign",
+        "product": "tweak",
+        "identity": "adhoc"
+      },
+      {
+        "type": "compile",
+        "product": "prefs"
+      },
+      {
+        "type": "link",
+        "product": "prefs"
+      },
+      {
+        "type": "bundle-resources",
+        "product": "prefs"
+      },
+      {
+        "type": "lipo",
+        "product": "prefs"
+      },
+      {
+        "type": "dsym",
+        "product": "prefs"
+      },
+      {
+        "type": "strip",
+        "product": "prefs",
+        "style": "non-global"
+      },
+      {
+        "type": "sign",
+        "product": "prefs",
+        "identity": "adhoc"
+      }
+    ]
+  },
+  "package": {
+    "id": "com.simon.hidden-album",
+    "name": "隐藏相册隐藏",
+    "version": "0.0.1",
+    "description": "把照片 App「已隐藏」相簿内容隐藏为空并显示“无照片或视频”，带偏好设置开关。",
+    "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
+    "author": "Simon",
+    "section": "Tweaks",
+    "depends": [
+      "mobilesubstrate",
+      "preferenceloader"
+    ],
+    "layout": [
+      {
+        "path": "/Library/MobileSubstrate/DynamicLibraries/HiddenAlbum.dylib",
+        "product": "tweak"
+      },
+      {
+        "path": "/Library/PreferenceBundles/HiddenAlbumSettings.bundle",
+        "product": "prefs"
+      },
+      {
+        "path": "/Library/PreferenceLoader/Preferences/HiddenAlbumSettings.plist",
+        "file": "PreferenceBundle/Packaging/entry.plist",
+        "mode": "0644"
+      }
+    ],
+    "tweakFilter": {
+      "dylib": "tweak",
+      "bundles": [
+        "com.apple.mobileslideshow"
+      ]
+    }
+  }
+}
