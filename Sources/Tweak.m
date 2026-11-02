@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 OwnGoal Studio
 //
-// Hides the contents of the Photos app's "Hidden" smart album by handing the
-// grid an empty PhotoKit fetch result, so it shows Photos' own empty state.
-// The settings switch lives in the HiddenAlbumSettings preference bundle and
-// is read from the com.simon.hidden-album preferences domain.
+// Hides the contents of the Photos app's "Hidden" smart album, so the album
+// grid shows Photos' own empty state. The settings switch lives in the
+// HiddenAlbumSettings preference bundle and is read from the
+// com.simon.hidden-album preferences domain.
+//
+// The album grid does not render +[PHAsset fetchAssetsInAssetCollection:options:]:
+// Photos asks its PhotosUI data source for counts instead, a PXPhotosDataSource
+// whose containerCollection is the "Hidden" smart album (type 2, subtype 205).
+// Making that data source answer zero items leaves the section in place and the
+// grid shows its empty state, which is what an album with no items looks like.
+// The PhotoKit fetch is emptied too, so the album's own count agrees.
 //
 // Photos runs PhotoKit in multi-library mode, where the single-library fetch
 // APIs raise "Calling single library mode API while in multi library mode",
-// and calling PhotoKit from inside a PhotoKit fetch was seen to hang the app.
-// The empty result is therefore built once, off the fetch path, by an async
-// task that tries the ways in turn and keeps the first that answers a count
-// of 0. Until one works the hook changes nothing.
+// and calling PhotoKit from inside a PhotoKit fetch was seen to hang the app:
+// the empty result is therefore built once, off the fetch path.
 //
 // The build defines APELIN_PACKAGE_ID, APELIN_VERSION and APELIN_BUILD_ID as
 // string literals on every compile.
@@ -19,8 +24,11 @@
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
 #import <notify.h>
+#import <objc/runtime.h>
 #import <os/log.h>
 #import <substrate.h>
+
+#import "ApelinBootstrap.h"
 
 static os_log_t TweakLog(void) {
     static os_log_t log;
@@ -29,6 +37,62 @@ static os_log_t TweakLog(void) {
         log = os_log_create(APELIN_PACKAGE_ID, "tweak");
     });
     return log;
+}
+
+#pragma mark - A log file the Photos sandbox still lets us write
+
+// A line here is readable through shell_run while Photos keeps running, which
+// the unified log cannot do. Kept small: it is a diagnostic, not a record.
+static NSString *DebugLogPath(void) {
+    static NSString *path;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray<NSString *> *candidates = @[
+            ApelinBootstrapPath(@"/var/mobile/Library/HiddenAlbumDebug.log") ?: @"",
+            ApelinBootstrapPath(@"/var/tmp/HiddenAlbumDebug.log") ?: @"",
+        ];
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        for (NSString *candidate in candidates) {
+            if (candidate.length == 0) {
+                continue;
+            }
+            [fileManager createFileAtPath:candidate contents:nil attributes:nil];
+            if ([fileManager isWritableFileAtPath:candidate]) {
+                path = candidate;
+                break;
+            }
+        }
+    });
+    return path;
+}
+
+static void FileLog(NSString *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *line = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    NSString *path = DebugLogPath();
+    if (path == nil) {
+        return;
+    }
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("com.simon.hidden-album.filelog", DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_async(queue, ^{
+        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (handle == nil) {
+            return;
+        }
+        @try {
+            [handle seekToEndOfFile];
+            [handle writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        [handle closeFile];
+    });
 }
 
 #pragma mark - The setting
@@ -54,17 +118,17 @@ static BOOL HiddenContentsEnabled(void) {
     if (!gLoaded) {
         gEnabled = ReadEnabledFromPreferences();
         gLoaded = YES;
-        os_log(TweakLog(), "ApelinSetting enabled=%d", gEnabled ? 1 : 0);
+        FileLog(@"setting enabled=%d", gEnabled ? 1 : 0);
     }
     return gEnabled;
 }
 
-// The pane posts <package id>/changed; re-read the value on the next fetch.
+// The pane posts <package id>/changed; re-read the value on the next call.
 static void SettingChanged(void) {
     BOOL enabled = ReadEnabledFromPreferences();
     gEnabled = enabled;
     gLoaded = YES;
-    os_log(TweakLog(), "ApelinSetting changed enabled=%d", enabled ? 1 : 0);
+    FileLog(@"setting changed enabled=%d", enabled ? 1 : 0);
 }
 
 static void StartListeningForSettingChanges(void) {
@@ -91,87 +155,29 @@ static BOOL IsHiddenSmartAlbum(PHAssetCollection *collection) {
            collection.assetCollectionSubtype == PHAssetCollectionSubtypeSmartAlbumAllHidden;
 }
 
-// The empty result, built off the fetch path: 0 not tried, 1 building,
+// The empty fetch result, built off the fetch path: 0 not tried, 1 building,
 // 2 ready, -1 no way works.
 static PHFetchResult<PHAsset *> *gEmptyResult = nil;
 static NSInteger gEmptyState = 0;
-static PHAssetCollection *gHiddenCollection = nil;
 static PHFetchOptions *gHiddenOptions = nil;
 
-// A predicate no asset satisfies: nothing was created a century from now.
-static NSPredicate *NothingMatchesPredicate(void) {
-    NSDate *farFuture = [NSDate dateWithTimeIntervalSinceNow:60.0 * 60.0 * 24.0 * 365.0 * 100.0];
-    return [NSPredicate predicateWithFormat:@"dateCreated > %@", farFuture];
-}
-
-static void FinishBuildingEmptyResult(PHFetchResult<PHAsset *> *result, NSString *how) {
-    if (result != nil && result.count == 0) {
-        gEmptyResult = result;
-        gEmptyState = 2;
-        os_log(TweakLog(), "ApelinEmpty ready via %{public}@, count=%lu", how,
-               (unsigned long)result.count);
-        return;
-    }
-    os_log(TweakLog(), "ApelinEmpty %{public}@ gave %d item(s)", how,
-           result != nil ? 1 : 0);
-}
-
 static void BuildEmptyResult(void) {
-    PHAssetCollection *collection = gHiddenCollection;
-    PHFetchOptions *options = gHiddenOptions;
-    os_log(TweakLog(), "ApelinEmpty building, collection=%{public}@ options=%{public}@",
-           collection.localizedTitle, NSStringFromClass([options class]));
-
-    // 1. The same library-aware collection fetch Photos itself makes, with a
-    //    predicate nothing satisfies.
-    if (collection != nil) {
-        @try {
-            PHFetchOptions *emptyOptions = options != nil ? [options copy] : [[PHFetchOptions alloc] init];
-            emptyOptions.predicate = NothingMatchesPredicate();
-            emptyOptions.sortDescriptors = nil;
-            PHFetchResult<PHAsset *> *result =
-                [PHAsset fetchAssetsInAssetCollection:collection options:emptyOptions];
-            FinishBuildingEmptyResult(result, @"collection+predicate");
-            if (gEmptyState == 2) {
-                return;
-            }
-        } @catch (NSException *exception) {
-            os_log_error(TweakLog(), "ApelinEmpty collection+predicate threw: %{public}@",
-                         exception.reason);
-        }
-    }
-
-    // 2. A local identifier that matches nothing, with the fetch's own options.
     @try {
         PHFetchResult<PHAsset *> *result =
             [PHAsset fetchAssetsWithLocalIdentifiers:@[@"apelin-hidden-album-none"]
-                                             options:options];
-        FinishBuildingEmptyResult(result, @"localIdentifier");
-        if (gEmptyState == 2) {
+                                             options:gHiddenOptions];
+        if (result != nil && result.count == 0) {
+            gEmptyResult = result;
+            gEmptyState = 2;
+            FileLog(@"empty fetch result ready");
             return;
         }
     } @catch (NSException *exception) {
-        os_log_error(TweakLog(), "ApelinEmpty localIdentifier threw: %{public}@", exception.reason);
+        FileLog(@"empty fetch result threw: %@", exception.reason);
     }
-
-    // 3. The whole library with the same predicate.
-    @try {
-        PHFetchOptions *emptyOptions = [[PHFetchOptions alloc] init];
-        emptyOptions.predicate = NothingMatchesPredicate();
-        PHFetchResult<PHAsset *> *result = [PHAsset fetchAssetsWithOptions:emptyOptions];
-        FinishBuildingEmptyResult(result, @"library+predicate");
-        if (gEmptyState == 2) {
-            return;
-        }
-    } @catch (NSException *exception) {
-        os_log_error(TweakLog(), "ApelinEmpty library+predicate threw: %{public}@", exception.reason);
-    }
-
     gEmptyState = -1;
-    os_log_error(TweakLog(), "ApelinEmpty no way works; the album is left as it is");
+    FileLog(@"empty fetch result unavailable");
 }
-
-#pragma mark - +[PHAsset fetchAssetsInAssetCollection:options:]
 
 static PHFetchResult<PHAsset *> *(*OriginalFetchAssetsInAssetCollection)(id, SEL,
                                                                         PHAssetCollection *,
@@ -184,28 +190,15 @@ static PHFetchResult<PHAsset *> *HookedFetchAssetsInAssetCollection(id self, SEL
         OriginalFetchAssetsInAssetCollection != NULL
             ? OriginalFetchAssetsInAssetCollection(self, _cmd, collection, options)
             : nil;
-    BOOL hidden = IsHiddenSmartAlbum(collection);
-    BOOL enabled = HiddenContentsEnabled();
-    os_log(TweakLog(),
-           "ApelinFetch title=%{public}@ type=%ld subtype=%ld hidden=%d enabled=%d count=%lu state=%ld",
-           [collection respondsToSelector:@selector(localizedTitle)] ? collection.localizedTitle : @"(nil)",
-           (long)collection.assetCollectionType,
-           (long)collection.assetCollectionSubtype,
-           hidden ? 1 : 0,
-           enabled ? 1 : 0,
-           (unsigned long)original.count,
-           (long)gEmptyState);
-    if (!hidden || !enabled) {
+    if (!IsHiddenSmartAlbum(collection) || !HiddenContentsEnabled()) {
         return original;
     }
+    FileLog(@"hidden collection fetch orig=%lu empty=%d",
+            (unsigned long)original.count, gEmptyResult != nil ? 1 : 0);
     if (gEmptyResult != nil) {
-        os_log(TweakLog(), "ApelinFetch hidden album emptied, returning count=%lu",
-               (unsigned long)gEmptyResult.count);
         return gEmptyResult;
     }
     if (gEmptyState == 0) {
-        // Build it away from this fetch: calling PhotoKit here hung the app.
-        gHiddenCollection = collection;
         gHiddenOptions = options;
         gEmptyState = 1;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -215,21 +208,129 @@ static PHFetchResult<PHAsset *> *HookedFetchAssetsInAssetCollection(id self, SEL
     return original;
 }
 
+#pragma mark - The grid: PXPhotosDataSource
+
+// A data source's verdict is kept on the object itself, so the collection is
+// read once and the hot count calls stay cheap. Reading it must not call the
+// data source's own methods: -[PXPhotosDataSource containerCollection] was
+// seen to ask for numberOfSections again, which re-entered this and crashed.
+static char kHiddenDataSourceKey;
+static __thread BOOL gResolvingDataSource = NO;
+
+static id ContainerCollectionFromIvars(id dataSource) {
+    for (Class cls = object_getClass(dataSource); cls != Nil; cls = class_getSuperclass(cls)) {
+        for (NSString *name in @[@"_containerCollection", @"_assetCollection", @"_collection"]) {
+            Ivar ivar = class_getInstanceVariable(cls, name.UTF8String);
+            if (ivar == NULL) {
+                continue;
+            }
+            const char *type = ivar_getTypeEncoding(ivar);
+            if (type == NULL || type[0] != '@') {
+                continue;
+            }
+            id value = object_getIvar(dataSource, ivar);
+            if (value != nil) {
+                return value;
+            }
+        }
+    }
+    return nil;
+}
+
+static BOOL DataSourceIsHiddenAlbum(id dataSource) {
+    if (gResolvingDataSource) {
+        return NO;  // A count call made from inside the lookup: leave it alone.
+    }
+    NSNumber *cached = objc_getAssociatedObject(dataSource, &kHiddenDataSourceKey);
+    if (cached != nil) {
+        return cached.boolValue;
+    }
+    gResolvingDataSource = YES;
+    BOOL hidden = NO;
+    @try {
+        id collection = ContainerCollectionFromIvars(dataSource);
+        if (collection == nil) {
+            collection = [dataSource valueForKey:@"containerCollection"];
+        }
+        hidden = IsHiddenSmartAlbum(collection);
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    gResolvingDataSource = NO;
+    objc_setAssociatedObject(dataSource, &kHiddenDataSourceKey, @(hidden),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return hidden;
+}
+
+static long (*OriginalNumberOfItemsInSection)(id, SEL, long);
+
+static long HookedNumberOfItemsInSection(id self, SEL _cmd, long section) {
+    long original = OriginalNumberOfItemsInSection != NULL
+                        ? OriginalNumberOfItemsInSection(self, _cmd, section)
+                        : 0;
+    if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
+        static NSInteger logged = 0;
+        if (logged < 10) {
+            logged++;
+            FileLog(@"grid %@ numberOfItemsInSection=%ld orig=%ld -> 0",
+                    NSStringFromClass([self class]), section, original);
+        }
+        return 0;
+    }
+    return original;
+}
+
+static long (*OriginalNumberOfSections)(id, SEL);
+
+static long HookedNumberOfSections(id self, SEL _cmd) {
+    long original = OriginalNumberOfSections != NULL ? OriginalNumberOfSections(self, _cmd) : 0;
+    if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
+        static NSInteger logged = 0;
+        if (logged < 10) {
+            logged++;
+            FileLog(@"grid %@ numberOfSections orig=%ld -> 0",
+                    NSStringFromClass([self class]), original);
+        }
+        return 0;
+    }
+    return original;
+}
+
 __attribute__((constructor)) static void TweakInitialize(void) {
     // Apelin's confirm_loaded looks for this exact marker and build id under
     // the package id's subsystem. Keep the line, and keep it public.
     os_log(TweakLog(), "ApelinLoaded %{public}s in %{public}s", APELIN_BUILD_ID, getprogname());
+    FileLog(@"=== loaded %@ in %s, log at %@", @APELIN_BUILD_ID, getprogname(), DebugLogPath());
 
     StartListeningForSettingChanges();
 
     Class phAsset = objc_getClass("PHAsset");
-    if (phAsset == Nil) {
-        os_log_error(TweakLog(), "ApelinSetup PHAsset missing");
-        return;
+    if (phAsset != Nil) {
+        MSHookMessageEx(object_getClass(phAsset),
+                        @selector(fetchAssetsInAssetCollection:options:),
+                        (IMP)HookedFetchAssetsInAssetCollection,
+                        (IMP *)&OriginalFetchAssetsInAssetCollection);
     }
-    MSHookMessageEx(object_getClass(phAsset),
-                    @selector(fetchAssetsInAssetCollection:options:),
-                    (IMP)HookedFetchAssetsInAssetCollection,
-                    (IMP *)&OriginalFetchAssetsInAssetCollection);
-    os_log(TweakLog(), "ApelinSetup hooked +[PHAsset fetchAssetsInAssetCollection:options:]");
+
+    Class photosDataSource = objc_getClass("PXPhotosDataSource");
+    if (photosDataSource != Nil &&
+        class_getInstanceMethod(photosDataSource, @selector(numberOfItemsInSection:)) != NULL) {
+        MSHookMessageEx(photosDataSource,
+                        @selector(numberOfItemsInSection:),
+                        (IMP)HookedNumberOfItemsInSection,
+                        (IMP *)&OriginalNumberOfItemsInSection);
+        FileLog(@"hooked -[PXPhotosDataSource numberOfItemsInSection:]");
+    } else {
+        FileLog(@"PXPhotosDataSource numberOfItemsInSection: missing");
+    }
+    if (photosDataSource != Nil &&
+        class_getInstanceMethod(photosDataSource, @selector(numberOfSections)) != NULL) {
+        MSHookMessageEx(photosDataSource,
+                        @selector(numberOfSections),
+                        (IMP)HookedNumberOfSections,
+                        (IMP *)&OriginalNumberOfSections);
+        FileLog(@"hooked -[PXPhotosDataSource numberOfSections]");
+    } else {
+        FileLog(@"PXPhotosDataSource numberOfSections missing");
+    }
 }
