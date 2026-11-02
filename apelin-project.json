@@ -57,7 +57,8 @@
       "frameworks": [
         "Foundation",
         "UIKit",
-        "Photos"
+        "Photos",
+        "LocalAuthentication"
       ],
       "libraries": [
         "substrate"

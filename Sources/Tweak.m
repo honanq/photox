@@ -23,6 +23,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
+#import <LocalAuthentication/LocalAuthentication.h>
 #import <notify.h>
 #import <objc/runtime.h>
 #import <os/log.h>
@@ -293,6 +294,31 @@ static BOOL DataSourceIsHiddenAlbum(id dataSource) {
     return hidden;
 }
 
+// The album is empty for us, so Photos no longer asks for Face ID before
+// showing it. Ask once per visit, the way Photos asks for its contents.
+static char kAskedFaceIDKey;
+
+static void RequestFaceIDForHiddenAlbum(id dataSource) {
+    if (objc_getAssociatedObject(dataSource, &kAskedFaceIDKey) != nil) {
+        return;
+    }
+    objc_setAssociatedObject(dataSource, &kAskedFaceIDKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LAContext *context = [[LAContext alloc] init];
+        NSError *error = nil;
+        if (![context canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
+                                  error:&error]) {
+            FileLog(@"faceid unavailable: %@", error.localizedDescription);
+            return;
+        }
+        [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
+                localizedReason:@"查看「已隐藏」相簿"
+                          reply:^(BOOL success, NSError *authError) {
+            FileLog(@"faceid success=%d error=%@", success ? 1 : 0, authError.localizedDescription);
+        }];
+    });
+}
+
 static long (*OriginalNumberOfItemsInSection)(id, SEL, long);
 
 static long HookedNumberOfItemsInSection(id self, SEL _cmd, long section) {
@@ -300,6 +326,7 @@ static long HookedNumberOfItemsInSection(id self, SEL _cmd, long section) {
                         ? OriginalNumberOfItemsInSection(self, _cmd, section)
                         : 0;
     if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
+        RequestFaceIDForHiddenAlbum(self);
         static NSInteger logged = 0;
         if (logged < 10) {
             logged++;
