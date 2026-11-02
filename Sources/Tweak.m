@@ -114,20 +114,17 @@ static BOOL ReadEnabledFromPreferences(void) {
     return YES;
 }
 
+// Read once, and again only when something says the value may have changed:
+// the pane's Darwin notification, or the app coming back to the front (the way
+// a change made in Settings reaches Photos). Nothing here polls.
 static BOOL HiddenContentsEnabled(void) {
-    // Re-read at most twice a second: the pane's notification was not seen to
-    // reach the process, and a stale value would keep the setting stuck until
-    // the app restarts.
-    static CFAbsoluteTime lastRead = 0;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (!gLoaded || now - lastRead > 0.5) {
+    if (!gLoaded) {
         BOOL enabled = ReadEnabledFromPreferences();
-        if (!gLoaded || enabled != gEnabled) {
-            FileLog(@"setting %@ enabled=%d", gLoaded ? @"changed" : @"read", enabled ? 1 : 0);
+        if (enabled != gEnabled) {
+            FileLog(@"setting read enabled=%d", enabled ? 1 : 0);
         }
         gEnabled = enabled;
         gLoaded = YES;
-        lastRead = now;
     }
     return gEnabled;
 }
@@ -148,6 +145,15 @@ static void StartListeningForSettingChanges(void) {
                                         (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/changed"),
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
+        // Coming back from Settings is the moment the value can differ.
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification *note) {
+            (void)note;
+            gLoaded = NO;
+        }];
     });
 }
 
