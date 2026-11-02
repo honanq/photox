@@ -343,6 +343,7 @@ static long (*OriginalNumberOfSections)(id, SEL);
 static long HookedNumberOfSections(id self, SEL _cmd) {
     long original = OriginalNumberOfSections != NULL ? OriginalNumberOfSections(self, _cmd) : 0;
     if (HiddenContentsEnabled() && DataSourceIsHiddenAlbum(self)) {
+        RequestFaceIDForHiddenAlbum(self);
         static NSInteger logged = 0;
         if (logged < 10) {
             logged++;
