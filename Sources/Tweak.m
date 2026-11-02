@@ -349,6 +349,78 @@ static UICollectionViewLayoutAttributes *HookedLayoutAttributesForItem(id self, 
     return attributes;
 }
 
+// The list keeps its own array of album gadgets; filtering that array (not the
+// provider's) keeps its counts, cells and indices consistent.
+static void FilterAlbumListGadgetArrays(id albumList) {
+    Class cls = object_getClass(albumList);
+    for (Class klass = cls; klass != Nil; klass = class_getSuperclass(klass)) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(klass, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *type = ivar_getTypeEncoding(ivars[i]);
+            if (type == NULL || type[0] != '@') {
+                continue;
+            }
+            id value = object_getIvar(albumList, ivars[i]);
+            if (![value isKindOfClass:[NSArray class]] || [value count] == 0) {
+                continue;
+            }
+            BOOL hasAlbumGadget = NO;
+            BOOL hasHidden = NO;
+            for (id element in (NSArray *)value) {
+                if (![element respondsToSelector:@selector(collection)]) {
+                    continue;
+                }
+                hasAlbumGadget = YES;
+                PHAssetCollection *collection = nil;
+                @try {
+                    collection = [(PUAlbumGadget *)element collection];
+                } @catch (NSException *exception) {
+                    (void)exception;
+                }
+                if (collection != nil && AlbumIsHidden(collection)) {
+                    hasHidden = YES;
+                    break;
+                }
+            }
+            if (!hasAlbumGadget || !hasHidden) {
+                continue;
+            }
+            NSMutableArray *kept = [NSMutableArray array];
+            for (id element in (NSArray *)value) {
+                PHAssetCollection *collection = nil;
+                if ([element respondsToSelector:@selector(collection)]) {
+                    @try {
+                        collection = [(PUAlbumGadget *)element collection];
+                    } @catch (NSException *exception) {
+                        (void)exception;
+                    }
+                }
+                if (collection != nil && AlbumIsHidden(collection)) {
+                    continue;
+                }
+                [kept addObject:element];
+            }
+            object_setIvar(albumList, ivars[i], kept);
+            // Keep the replacement alive: object_setIvar does not retain for us.
+            objc_setAssociatedObject(albumList, ivars[i], kept, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        free(ivars);
+    }
+}
+
+static id (*OriginalInitWithAlbumsGadgetProvider)(id, SEL, id);
+
+static id HookedInitWithAlbumsGadgetProvider(id self, SEL _cmd, id provider) {
+    id result = OriginalInitWithAlbumsGadgetProvider(self, _cmd, provider);
+    @try {
+        FilterAlbumListGadgetArrays(result);
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    return result;
+}
+
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
     if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
         MSHookMessageEx(cls, selector, hook, original);
@@ -416,5 +488,13 @@ __attribute__((constructor)) static void TweakInitialize(void) {
         class_getInstanceMethod(layoutClass, @selector(layoutAttributesForItemAtIndexPath:)) != NULL) {
         MSHookMessageEx(layoutClass, @selector(layoutAttributesForItemAtIndexPath:),
                         (IMP)HookedLayoutAttributesForItem, (IMP *)&OriginalLayoutAttributesForItem);
+    }
+
+    Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
+    if (albumListClass != Nil &&
+        class_getInstanceMethod(albumListClass, @selector(initWithAlbumsGadgetProvider:)) != NULL) {
+        MSHookMessageEx(albumListClass, @selector(initWithAlbumsGadgetProvider:),
+                        (IMP)HookedInitWithAlbumsGadgetProvider,
+                        (IMP *)&OriginalInitWithAlbumsGadgetProvider);
     }
 }
