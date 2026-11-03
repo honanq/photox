@@ -268,7 +268,6 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
 // instead of asking the provider again while a cell is laid out, and a new array is what
 // tells both the album list and the layout that something changed.
 static NSArray *gLastGadgets = nil;
-static unsigned long gAlbumListRevision = 0;
 
 static PHAssetCollection *CollectionOfGadget(id gadget) {
     PHAssetCollection *collection = nil;
@@ -289,7 +288,6 @@ static void RecordAlbumsInGadgets(NSArray *gadgets) {
         return;  // the same array: nothing new to read or publish
     }
     gLastGadgets = gadgets;
-    gAlbumListRevision++;
     if (gadgets.count == 0) {
         return;
     }
@@ -336,19 +334,70 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
 // indexing (it kept asking for index 10 of a 7 item array and crashed), so the
 // array is left alone and the layout is given the visible arrangement instead.
 static char kAlbumSlotMapKey;
+static char kAlbumListSourceKey;
+static char kAlbumListResolvedKey;
+static char kAlbumListProviderKey;
 
-// One pass over the album cards, kept on the layout: `hidden` says which albums the pane
+// The album cards of the list this layout draws. The layout's data source is resolved once
+// and kept, and so is its provider, so a cell being laid out never walks KVC again.
+static NSArray *AlbumCardsForLayout(id layout) {
+    NSNumber *resolved = objc_getAssociatedObject(layout, &kAlbumListResolvedKey);
+    if (resolved == nil) {
+        id candidate = nil;
+        @try {
+            candidate = [[layout valueForKey:@"collectionView"] dataSource];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
+        BOOL matches = candidate != nil && albumListClass != Nil &&
+                       [candidate isKindOfClass:albumListClass];
+        objc_setAssociatedObject(layout, &kAlbumListResolvedKey, @(matches),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!matches) {
+            return nil;  // another layout of the Albums tab
+        }
+        objc_setAssociatedObject(layout, &kAlbumListSourceKey, candidate,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if (!resolved.boolValue) {
+        return nil;
+    }
+
+    id dataSource = objc_getAssociatedObject(layout, &kAlbumListSourceKey);
+    id provider = objc_getAssociatedObject(dataSource, &kAlbumListProviderKey);
+    if (provider == nil) {
+        @try {
+            provider = [dataSource valueForKey:@"provider"];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        if (provider == nil || ![provider respondsToSelector:@selector(gadgets)]) {
+            return nil;
+        }
+        objc_setAssociatedObject(dataSource, &kAlbumListProviderKey, provider,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    NSArray *gadgets = nil;
+    @try {
+        gadgets = [(id)provider performSelector:@selector(gadgets)];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    return [gadgets isKindOfClass:[NSArray class]] ? gadgets : nil;
+}
+
+// One pass over this list's albums, kept on the layout: `hidden` says which albums the pane
 // hides, `slots` which visible position each one takes. It is rebuilt only when a switch
-// or the album list changed, so laying out a cell costs two array lookups.
+// changed, or when the list's length did, so laying out a cell costs two array lookups.
 static NSDictionary *AlbumSlotMap(id layout) {
-    NSArray *gadgets = gLastGadgets;
+    NSArray *gadgets = AlbumCardsForLayout(layout);
     if (gadgets == nil) {
-        return nil;  // the cards have not been handed out yet
+        return nil;
     }
     NSDictionary *cached = objc_getAssociatedObject(layout, &kAlbumSlotMapKey);
     if (cached != nil &&
         [cached[@"settings"] intValue] == gSettingsGeneration &&
-        [cached[@"albums"] unsignedLongValue] == gAlbumListRevision) {
+        [cached[@"count"] unsignedIntegerValue] == gadgets.count) {
         return cached;
     }
 
@@ -366,7 +415,7 @@ static NSDictionary *AlbumSlotMap(id layout) {
         }
     }
     NSDictionary *map = @{@"settings": @(gSettingsGeneration),
-                          @"albums": @(gAlbumListRevision),
+                          @"count": @(count),
                           @"hidden": hidden,
                           @"slots": slots};
     objc_setAssociatedObject(layout, &kAlbumSlotMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -374,7 +423,6 @@ static NSDictionary *AlbumSlotMap(id layout) {
 }
 
 static char kAlbumLayoutMetricsKey;
-static char kAlbumListLayoutKey;
 
 static UICollectionViewLayoutAttributes *(*OriginalAlbumLayoutItem)(id, SEL, NSIndexPath *);
 
@@ -413,25 +461,8 @@ static UICollectionViewLayoutAttributes *HookedAlbumLayoutItem(id self, SEL _cmd
     if (indexPath.section != 0 || indexPath.item < 0) {
         return attributes;
     }
-    // Resolved once and kept on the layout: does this one draw the album cards at all?
-    NSNumber *isAlbumList = objc_getAssociatedObject(self, &kAlbumListLayoutKey);
-    if (isAlbumList == nil) {
-        id dataSource = nil;
-        @try {
-            dataSource = [[self valueForKey:@"collectionView"] dataSource];
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
-        Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
-        isAlbumList = @(dataSource != nil && albumListClass != Nil &&
-                        [dataSource isKindOfClass:albumListClass]);
-        objc_setAssociatedObject(self, &kAlbumListLayoutKey, isAlbumList,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    if (!isAlbumList.boolValue) {
-        return attributes;
-    }
-
+    // AlbumSlotMap resolves the layout's own list once; nil means this layout draws another
+    // part of the Albums tab, and the attributes are left as Photos made them.
     NSDictionary *map = AlbumSlotMap(self);
     NSArray<NSNumber *> *hidden = map[@"hidden"];
     NSArray<NSNumber *> *slots = map[@"slots"];
