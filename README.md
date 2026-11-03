@@ -17,13 +17,13 @@
 4. **删除时不再询问**（默认关闭）：开启后，查看照片时点删除按钮直接删除，不再弹
    「从相簿中移除 / 删除 / 取消」。删除的照片仍在「最近删除」里，可照常恢复。
 5. **播放视频时自动开启声音**（默认关闭）：开启后，视频一开始播放就有声音；
-   播放中点静音按钮可以真正静音/恢复（该按钮的图标不会跟着变化，见下）。
+   此后静音按钮照常工作，静音、恢复与按钮图标都随状态变化。
 
 开关改动后照片 App 会自动重启一次以生效；相簿清单需要先打开一次照片的「相簿」页才会刷新。
 
 ## 实现要点
 
-只有五个钩子，每个都落在实现该方法的类上：
+只有九个钩子，每个都落在实现该方法的类上：
 
 | 类 / 方法 | 作用 |
 | --- | --- |
@@ -33,10 +33,13 @@
 | `-[PUAlbumsGadgetProvider gadgets]` | 读取相簿清单，写入设置页读取的偏好域 |
 | `-[PUDoubleHeightHorizontalAlbumListGadgetLayout layoutAttributesForItemAtIndexPath:]` | 隐藏指定相簿的卡片，并按可见序号重排 |
 | `-[PUOneUpViewController presentViewController:animated:completion:]` | 「删除时不再询问」：命中照片查看器的删除确认弹窗（先「从相簿中移除 / 删除」，再「删除照片」）时，直接执行其中的「删除」动作而不弹出 |
-| `-[PUBrowsingVideoPlayer setMuted:]`、`-[PXVideoSession setVolume:withFade:]`、`-[PUOneUpBarsController _performMuteAction:]` | 「播放视频时自动开启声音」：视频起播时不接受 Photos 自己的自动静音；静音按钮改为直接切换会话音量（1.0 ↔ 0.0） |
+| `-[PUOneUpBarsController _performMuteAction:]` | 「自动开声」：静音按钮在自己的变更块里同时设置播放器静音状态与会话音量，并让工具栏重算按钮 |
+| `-[PUBrowsingVideoPlayer setMuted:]` | 起播阶段 Photos 自己发出的静音请求按「不静音」执行 |
+| `-[PXVideoSession setVolume:withFade:]` | 记住当前会话，并在起播时把音量置为 1.0 |
 
-相簿可见性只扫描一次并缓存在 provider 上（设置变更或相簿数量变化才重建），
-布局回调只做数组查表；没有轮询、没有定时刷新、没有日志输出。
+钩子里没有重复计算：各段是否属于「人物与地点」按段落数缓存，相簿隐藏与槽位按「设置代次 +
+相簿列表代次」缓存，相簿清单只在数组变化时扫描并写出，布局实例只解析一次数据源。
+没有轮询、没有定时刷新、没有日志输出。
 
 不修改 `gadgets` 的返回值、也不改 `gadgetForIndexPath:` 的下标：照片 App 仍按原下标取
 相簿 gadget，删元素会导致越界崩溃与卡片串位。

@@ -3,10 +3,11 @@
 //
 // Photos, trimmed down: the "Hidden" smart album reads as empty (Photos draws
 // its own "无照片或视频"), the "人物与地点" block of the Albums tab is gone with its
-// title, and single albums can be left out of "我的相簿". Every switch belongs to
-// the HiddenAlbumSettings pane and lives in the com.simon.hidden-album domain.
+// title, and single albums can be left out of "我的相簿". A video can start with
+// sound, with its mute button still working. Every switch belongs to the
+// HiddenAlbumSettings pane and lives in the com.simon.hidden-album domain.
 //
-// Six hooks, each on the class that implements the method:
+// Nine hooks, each on the class that implements the method:
 //   -[PXPhotosDataSource numberOfSections]                    the Hidden album
 //   -[PXGadgetUIViewController collectionView:numberOfItemsInSection:]      \
 //   -[PXGadgetUIViewController collectionView:layout:referenceSize...:]      / 人物与地点
@@ -15,6 +16,9 @@
 //                                                              hidden album cards
 //   -[PUOneUpViewController presentViewController:animated:completion:]
 //                                                              deleting without asking
+//   -[PUOneUpBarsController _performMuteAction:]               the mute button
+//   -[PUBrowsingVideoPlayer setMuted:]                         a video's start mute
+//   -[PXVideoSession setVolume:withFade:]                      the video's audio level
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -179,17 +183,11 @@ static long HookedNumberOfSections(id self, SEL _cmd) {
 - (id)_gadgetAtIndexPath:(NSIndexPath *)indexPath;
 @end
 
-static BOOL GadgetIsPeopleAndPlaces(id gadget) {
-    NSString *title = nil;
-    @try {
-        id value = [gadget valueForKey:@"title"];
-        if (value == nil) {
-            value = [gadget valueForKey:@"localizedTitle"];
-        }
-        title = [value description];
-    } @catch (NSException *exception) {
-        return NO;
-    }
+static char kPeopleSectionsKey;
+
+// The title is what tells the 人物与地点 block apart: its gadget is the same class as the
+// album ones, so the class name says nothing.
+static BOOL TitleIsPeopleAndPlaces(NSString *title) {
     if (title.length == 0) {
         return NO;
     }
@@ -200,22 +198,65 @@ static BOOL GadgetIsPeopleAndPlaces(id gadget) {
     return people && places;
 }
 
-static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section) {
-    id gadget = nil;
+// A gadget's title is read once for the whole section list, never once per layout pass.
+static BOOL GadgetIsPeopleAndPlaces(id gadget) {
+    NSString *title = nil;
     @try {
-        gadget = [(PXGadgetUIViewController *)controller
-            _gadgetAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:section]];
+        id value = [gadget valueForKey:@"title"];
+        if (![value isKindOfClass:[NSString class]] || [value length] == 0) {
+            value = [gadget valueForKey:@"localizedTitle"];
+        }
+        if ([value isKindOfClass:[NSString class]]) {
+            title = value;
+        }
     } @catch (NSException *exception) {
-        (void)exception;
+        return NO;
     }
-    return gadget != nil && GadgetIsPeopleAndPlaces(gadget);
+    return TitleIsPeopleAndPlaces(title);
+}
+
+static NSArray<NSNumber *> *PeopleSectionFlags(id controller, NSInteger sections) {
+    NSMutableArray<NSNumber *> *flags =
+        [NSMutableArray arrayWithCapacity:(NSUInteger)MAX(sections, 0)];
+    for (NSInteger index = 0; index < sections; index++) {
+        id gadget = nil;
+        @try {
+            gadget = [(PXGadgetUIViewController *)controller
+                _gadgetAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:index]];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        [flags addObject:@(gadget != nil && GadgetIsPeopleAndPlaces(gadget))];
+    }
+    return flags;
+}
+
+// Both the item count and the header size of every section ask this, on each layout pass,
+// so the verdicts are kept on the controller and rebuilt only when the section count moves.
+static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section,
+                                     UICollectionView *collectionView) {
+    if (!gHidePeopleAndPlaces || section < 0 || collectionView == nil) {
+        return NO;
+    }
+    NSInteger sections = (NSInteger)collectionView.numberOfSections;
+    NSDictionary *cached = objc_getAssociatedObject(controller, &kPeopleSectionsKey);
+    NSArray<NSNumber *> *flags = nil;
+    if (cached != nil && [cached[@"sections"] integerValue] == sections) {
+        flags = cached[@"flags"];
+    } else {
+        flags = PeopleSectionFlags(controller, sections);
+        objc_setAssociatedObject(controller, &kPeopleSectionsKey,
+                                 @{@"sections": @(sections), @"flags": flags},
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return (NSUInteger)section < flags.count && flags[(NSUInteger)section].boolValue;
 }
 
 static NSInteger (*OriginalGadgetNumberOfItems)(id, SEL, UICollectionView *, NSInteger);
 
 static NSInteger HookedGadgetNumberOfItems(id self, SEL _cmd, UICollectionView *collectionView,
                                            NSInteger section) {
-    if (gHidePeopleAndPlaces && SectionIsPeopleAndPlaces(self, section)) {
+    if (SectionIsPeopleAndPlaces(self, section, collectionView)) {
         return 0;
     }
     return OriginalGadgetNumberOfItems(self, _cmd, collectionView, section);
@@ -225,7 +266,7 @@ static CGSize (*OriginalHeaderSize)(id, SEL, UICollectionView *, UICollectionVie
 
 static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionView,
                                UICollectionViewLayout *layout, NSInteger section) {
-    if (gHidePeopleAndPlaces && SectionIsPeopleAndPlaces(self, section)) {
+    if (SectionIsPeopleAndPlaces(self, section, collectionView)) {
         return CGSizeMake(0, 0);
     }
     return OriginalHeaderSize(self, _cmd, collectionView, layout, section);
@@ -240,14 +281,13 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
 - (PHAssetCollection *)collection;
 @end
 
-static void RecordAlbumFromGadget(id gadget) {
-    static NSMutableArray<NSDictionary *> *albums;
-    static NSMutableSet<NSString *> *seen;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        albums = [NSMutableArray array];
-        seen = [NSMutableSet set];
-    });
+// The album cards Photos last handed out. The layout reads its positions from this array
+// instead of asking the provider again while a cell is laid out, and a new array is what
+// tells both the album list and the layout that something changed.
+static NSArray *gLastGadgets = nil;
+static unsigned long gAlbumListRevision = 0;
+
+static PHAssetCollection *CollectionOfGadget(id gadget) {
     PHAssetCollection *collection = nil;
     @try {
         if ([gadget respondsToSelector:@selector(collection)]) {
@@ -256,23 +296,43 @@ static void RecordAlbumFromGadget(id gadget) {
     } @catch (NSException *exception) {
         (void)exception;
     }
-    NSString *identifier = collection.localIdentifier;
-    NSString *title = collection.localizedTitle;
-    if (identifier.length == 0 || title.length == 0 || [seen containsObject:identifier]) {
+    return [collection isKindOfClass:[PHAssetCollection class]] ? collection : nil;
+}
+
+// The pane runs in Settings, which cannot read the photo library, so it is handed the album
+// list gathered from those cards. It is published only when the list itself changed.
+static void RecordAlbumsInGadgets(NSArray *gadgets) {
+    if (gadgets == gLastGadgets && gadgets != nil) {
+        return;  // the same array: nothing new to read or publish
+    }
+    gLastGadgets = gadgets;
+    gAlbumListRevision++;
+    if (gadgets.count == 0) {
         return;
     }
-    // People and Places have their own switch above; they are not albums here.
-    NSString *gadgetClass = NSStringFromClass([gadget class]);
-    if ([gadgetClass containsString:@"People"] || [gadgetClass containsString:@"Place"] ||
-        [title containsString:@"人物"] || [title containsString:@"地点"] ||
-        [title rangeOfString:@"people" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-        [title rangeOfString:@"places" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+    NSMutableArray<NSDictionary *> *albums = [NSMutableArray arrayWithCapacity:gadgets.count];
+    NSMutableSet<NSString *> *seen = [NSMutableSet setWithCapacity:gadgets.count];
+    for (id gadget in gadgets) {
+        PHAssetCollection *collection = CollectionOfGadget(gadget);
+        NSString *identifier = collection.localIdentifier;
+        NSString *title = collection.localizedTitle;
+        if (identifier.length == 0 || title.length == 0 || [seen containsObject:identifier]) {
+            continue;
+        }
+        // People and Places have their own switch above; they are not albums here.
+        if (TitleIsPeopleAndPlaces(title)) {
+            continue;
+        }
+        [seen addObject:identifier];
+        [albums addObject:@{@"id": identifier, @"title": title}];
+    }
+    static NSArray<NSDictionary *> *published;
+    if (published != nil && [published isEqualToArray:albums]) {
         return;
     }
-    [seen addObject:identifier];
-    [albums addObject:@{@"id": identifier, @"title": title}];
+    published = [albums copy];
     CFPreferencesSetAppValue(CFSTR("albumInventory"),
-                             (__bridge CFPropertyListRef)[albums copy],
+                             (__bridge CFPropertyListRef)published,
                              (__bridge CFStringRef)@APELIN_PACKAGE_ID);
     CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
 }
@@ -281,9 +341,7 @@ static NSArray *(*OriginalGadgetProviderGadgets)(id, SEL);
 
 static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     NSArray *gadgets = OriginalGadgetProviderGadgets(self, _cmd);
-    for (id gadget in gadgets) {
-        RecordAlbumFromGadget(gadget);
-    }
+    RecordAlbumsInGadgets(gadgets);
     return gadgets;
 }
 
@@ -296,47 +354,27 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
 // array is left alone and the layout is given the visible arrangement instead.
 static char kAlbumSlotMapKey;
 
-// One pass over the provider's albums, cached per provider until the switches
-// change or the list does: `hidden` says which albums the pane hides, `slots`
-// says which visible position each album takes.
-static NSDictionary *AlbumSlotMap(id albumListGadget) {
-    id provider = nil;
-    @try {
-        provider = [albumListGadget valueForKey:@"provider"];
-    } @catch (NSException *exception) {
-        (void)exception;
+// One pass over the album cards, kept on the layout: `hidden` says which albums the pane
+// hides, `slots` which visible position each one takes. It is rebuilt only when a switch
+// or the album list changed, so laying out a cell costs two array lookups.
+static NSDictionary *AlbumSlotMap(id layout) {
+    NSArray *gadgets = gLastGadgets;
+    if (gadgets == nil) {
+        return nil;  // the cards have not been handed out yet
     }
-    if (provider == nil || ![provider respondsToSelector:@selector(gadgets)]) {
-        return nil;
-    }
-    NSArray *gadgets = nil;
-    @try {
-        gadgets = [(id)provider performSelector:@selector(gadgets)];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    if (![gadgets isKindOfClass:[NSArray class]]) {
-        return nil;
-    }
-
-    NSDictionary *cached = objc_getAssociatedObject(provider, &kAlbumSlotMapKey);
-    if ([cached[@"generation"] intValue] == gSettingsGeneration &&
-        [cached[@"count"] unsignedIntegerValue] == gadgets.count) {
+    NSDictionary *cached = objc_getAssociatedObject(layout, &kAlbumSlotMapKey);
+    if (cached != nil &&
+        [cached[@"settings"] intValue] == gSettingsGeneration &&
+        [cached[@"albums"] unsignedLongValue] == gAlbumListRevision) {
         return cached;
     }
 
-    NSMutableArray<NSNumber *> *hidden = [NSMutableArray arrayWithCapacity:gadgets.count];
-    NSMutableArray<NSNumber *> *slots = [NSMutableArray arrayWithCapacity:gadgets.count];
+    NSUInteger count = gadgets.count;
+    NSMutableArray<NSNumber *> *hidden = [NSMutableArray arrayWithCapacity:count];
+    NSMutableArray<NSNumber *> *slots = [NSMutableArray arrayWithCapacity:count];
     NSUInteger visible = 0;
     for (id gadget in gadgets) {
-        PHAssetCollection *collection = nil;
-        if ([gadget respondsToSelector:@selector(collection)]) {
-            @try {
-                collection = [(PUAlbumGadget *)gadget collection];
-            } @catch (NSException *exception) {
-                (void)exception;
-            }
-        }
+        PHAssetCollection *collection = CollectionOfGadget(gadget);
         BOOL isHidden = collection != nil && AlbumIsHidden(collection);
         [hidden addObject:@(isHidden)];
         [slots addObject:@(visible)];
@@ -344,11 +382,11 @@ static NSDictionary *AlbumSlotMap(id albumListGadget) {
             visible++;
         }
     }
-    NSDictionary *map = @{@"generation": @(gSettingsGeneration),
-                          @"count": @(gadgets.count),
+    NSDictionary *map = @{@"settings": @(gSettingsGeneration),
+                          @"albums": @(gAlbumListRevision),
                           @"hidden": hidden,
                           @"slots": slots};
-    objc_setAssociatedObject(provider, &kAlbumSlotMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(layout, &kAlbumSlotMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return map;
 }
 
@@ -389,36 +427,32 @@ static BOOL AlbumLayoutMetrics(id layout, SEL _cmd, CGFloat *columnStep, CGFloat
 static UICollectionViewLayoutAttributes *HookedAlbumLayoutItem(id self, SEL _cmd,
                                                                NSIndexPath *indexPath) {
     UICollectionViewLayoutAttributes *attributes = OriginalAlbumLayoutItem(self, _cmd, indexPath);
-    if (indexPath.section != 0) {
+    if (indexPath.section != 0 || indexPath.item < 0) {
         return attributes;
     }
-    // Asked once per layout: does this one lay out the album cards at all?
+    // Resolved once and kept on the layout: does this one draw the album cards at all?
     NSNumber *isAlbumList = objc_getAssociatedObject(self, &kAlbumListLayoutKey);
-    id dataSource = nil;
-    if (isAlbumList == nil || isAlbumList.boolValue) {
+    if (isAlbumList == nil) {
+        id dataSource = nil;
         @try {
             dataSource = [[self valueForKey:@"collectionView"] dataSource];
         } @catch (NSException *exception) {
             (void)exception;
         }
-    }
-    if (isAlbumList == nil) {
         Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
-        BOOL matches = dataSource != nil && albumListClass != Nil &&
-                       [dataSource isKindOfClass:albumListClass];
-        objc_setAssociatedObject(self, &kAlbumListLayoutKey, @(matches),
+        isAlbumList = @(dataSource != nil && albumListClass != Nil &&
+                        [dataSource isKindOfClass:albumListClass]);
+        objc_setAssociatedObject(self, &kAlbumListLayoutKey, isAlbumList,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (!matches) {
-            return attributes;
-        }
-    } else if (!isAlbumList.boolValue || dataSource == nil) {
+    }
+    if (!isAlbumList.boolValue) {
         return attributes;
     }
 
-    NSDictionary *map = AlbumSlotMap(dataSource);
+    NSDictionary *map = AlbumSlotMap(self);
     NSArray<NSNumber *> *hidden = map[@"hidden"];
     NSArray<NSNumber *> *slots = map[@"slots"];
-    if (indexPath.item < 0 || (NSUInteger)indexPath.item >= hidden.count) {
+    if ((NSUInteger)indexPath.item >= hidden.count) {
         return attributes;
     }
     if (hidden[indexPath.item].boolValue) {
@@ -554,7 +588,11 @@ static void (*OriginalSessionSetVolume)(id, SEL, float, BOOL);
 static __weak PXVideoSession *gLastSession = nil;
 
 static void HookedSessionSetVolume(id self, SEL _cmd, float volume, BOOL fade) {
-    gLastSession = (PXVideoSession *)self;
+    if (gLastSession != (PXVideoSession *)self) {
+        // Another video: what Photos mutes while it starts belongs to Photos again.
+        gUserTouchedMute = NO;
+        gLastSession = (PXVideoSession *)self;
+    }
     OriginalSessionSetVolume(self, _cmd, volume, fade);
 }
 
@@ -581,7 +619,6 @@ static void HookedSetMuted(id self, SEL _cmd, BOOL muted) {
 
 static void (*OriginalPerformMuteAction)(id, SEL, BOOL);
 
-
 static void HookedPerformMuteAction(id self, SEL _cmd, BOOL muted) {
     gUserTouchedMute = YES;
     PUOneUpBarsController *bars = (PUOneUpBarsController *)self;
@@ -600,21 +637,15 @@ static void HookedPerformMuteAction(id self, SEL _cmd, BOOL muted) {
         PXVideoSession *session = player.videoSession ?: gLastSession;
         BOOL shouldMute = session != nil ? (session.volume > 0.5f) : !player.isMuted;
 
-        // Publish the matching model state through Photos' change block, then align the
-        // actual session audio. In the previous attempt, dot syntax called missing
-        // setIsMuted: and the swallowed exception left the icon state untouched.
+        // Photos' own state and the session's audio are both set here, inside the changes
+        // block, and the bars are told to recompute their play/pause items: the button's
+        // icon follows this state, the sound follows the session volume.
         [player setMuted:shouldMute];
         [session setVolume:(shouldMute ? 0.0f : 1.0f) withFade:YES];
         [bars _setNeedsUpdatePlayPauseItems:YES];
         [bars updateBars];
     }];
 }
-
-
-// PUBrowsingVideoPlayer lives in PhotosUICore, which is not loaded yet when this tweak
-// is injected, so its hook goes in as soon as the class is there: on activation, when
-// the viewer appears, and when the play button is used.
-static void (*OriginalTogglePlayback)(id, SEL);
 
 static void InstallVideoPlayerHooks(void) {
     static BOOL installed = NO;
@@ -633,27 +664,6 @@ static void InstallVideoPlayerHooks(void) {
                         (IMP)HookedSessionSetVolume, (IMP *)&OriginalSessionSetVolume);
     }
     installed = YES;
-}
-
-static void HookedTogglePlayback(id self, SEL _cmd) {
-    InstallVideoPlayerHooks();
-    OriginalTogglePlayback(self, _cmd);
-}
-
-// A video can start playing by itself (autoplay), before the viewer has appeared:
-// the hooks go in as early as the viewer's viewWillAppear, and again on appear.
-static void (*OriginalOneUpViewWillAppear)(id, SEL, BOOL);
-static void (*OriginalOneUpViewDidAppear)(id, SEL, BOOL);
-
-static void HookedOneUpViewWillAppear(id self, SEL _cmd, BOOL animated) {
-    gUserTouchedMute = NO;   // a video newly opened: its start mutes are Photos' own
-    InstallVideoPlayerHooks();
-    OriginalOneUpViewWillAppear(self, _cmd, animated);
-}
-
-static void HookedOneUpViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    OriginalOneUpViewDidAppear(self, _cmd, animated);
-    InstallVideoPlayerHooks();
 }
 
 #pragma mark - Hooks
@@ -704,12 +714,6 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     HookSelector(objc_getClass("PUOneUpViewController"),
                  @selector(presentViewController:animated:completion:),
                  (IMP)HookedPresentViewController, (IMP *)&OriginalPresentViewController);
-    HookSelector(objc_getClass("PUOneUpViewController"), @selector(togglePlayback:),
-                 (IMP)HookedTogglePlayback, (IMP *)&OriginalTogglePlayback);
-    HookSelector(objc_getClass("PUOneUpViewController"), @selector(viewWillAppear:),
-                 (IMP)HookedOneUpViewWillAppear, (IMP *)&OriginalOneUpViewWillAppear);
-    HookSelector(objc_getClass("PUOneUpViewController"), @selector(viewDidAppear:),
-                 (IMP)HookedOneUpViewDidAppear, (IMP *)&OriginalOneUpViewDidAppear);
 
     HookSelector(objc_getClass("PUOneUpBarsController"), @selector(_performMuteAction:),
                  (IMP)HookedPerformMuteAction, (IMP *)&OriginalPerformMuteAction);
