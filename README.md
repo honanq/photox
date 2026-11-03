@@ -10,7 +10,9 @@
 
 ## 功能
 
-1. **已隐藏相簿显示为空**：打开「已隐藏」相簿时显示系统自带的「无照片或视频」。
+1. **已隐藏相簿显示为空**：保留系统原生认证；原生隐私控制器仍锁定时不改数据源，
+   认证成功并解锁后才显示系统自带的「无照片或视频」。失败、取消与重新锁定均由系统处理。
+   不修改认证结果，也不替系统关闭或开启照片的 Face ID 设置。
 2. **隐藏「人物与地点」**：相簿页中的「人物与地点」整组连同标题一起不显示。
 3. **按相簿隐藏**：在设置里逐个勾选「我的相簿」中要隐藏的相簿（含「最近项目」「个人收藏」
    等智能相簿），勾选后该卡片从相簿页消失，后面的卡片自动补位。
@@ -27,7 +29,7 @@
 
 | 类 / 方法 | 作用 |
 | --- | --- |
-| `-[PXPhotosDataSource numberOfSections]` | 「已隐藏」智能相簿返回 0 段 |
+| `-[PXPhotosDataSource numberOfSections]` | 原生隐私控制器已解锁后，「已隐藏」智能相簿返回 0 段；锁定时返回原始计数 |
 | `-[PXGadgetUIViewController collectionView:numberOfItemsInSection:]` | 「人物与地点」段不留条目 |
 | `-[PXGadgetUIViewController collectionView:layout:referenceSizeForHeaderInSection:]` | 该段标题高度归零 |
 | `-[PUAlbumsGadgetProvider gadgets]` | 读取相簿清单，写入设置页读取的偏好域 |

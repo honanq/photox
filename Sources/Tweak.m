@@ -109,10 +109,26 @@ static BOOL IsHiddenSmartAlbum(PHAssetCollection *collection) {
            collection.assetCollectionSubtype == PHAssetCollectionSubtypeSmartAlbumAllHidden;
 }
 
-// A data source's verdict is kept on the object itself, so the collection is
-// read once and the hot count call stays a lookup. Reading it must not call the
-// data source's own methods: -[PXPhotosDataSource containerCollection] asks for
-// numberOfSections again, which re-entered this and crashed the app.
+// Read only Photos' own lock state. Authentication, cancellation, relocking,
+// and the protected "使用面容查看" presentation remain entirely native.
+@interface PXContentPrivacyController : NSObject
++ (instancetype)privacyControllerForCollection:(id)collection;
+- (BOOL)isLocked;
+@end
+
+@interface HAHiddenAlbumContext : NSObject
+@property (nonatomic, strong) PHAssetCollection *collection;
+// Photos owns its controller. A teardown must not leave us using an old,
+// retained controller whose lock state no longer belongs to the native UI.
+@property (nonatomic, weak) PXContentPrivacyController *privacyController;
+@end
+
+@implementation HAHiddenAlbumContext
+@end
+
+// Cache collection identity, never authorization. Reading the collection must
+// not rely on an unguarded count: -containerCollection may ask for the count
+// again. The reentrant call always receives the original implementation.
 static char kHiddenDataSourceKey;
 static __thread BOOL gResolvingDataSource = NO;
 
@@ -136,29 +152,65 @@ static id ContainerCollectionFromIvars(id dataSource) {
     return nil;
 }
 
-static BOOL DataSourceIsHiddenAlbum(id dataSource) {
+static HAHiddenAlbumContext *HiddenAlbumContextForDataSource(id dataSource) {
     if (gResolvingDataSource) {
-        return NO;  // A count call made from inside the lookup: leave it alone.
+        return nil;
     }
-    NSNumber *cached = objc_getAssociatedObject(dataSource, &kHiddenDataSourceKey);
+    id cached = objc_getAssociatedObject(dataSource, &kHiddenDataSourceKey);
     if (cached != nil) {
-        return cached.boolValue;
+        return cached == [NSNull null] ? nil : cached;
     }
+
     gResolvingDataSource = YES;
-    BOOL hidden = NO;
+    HAHiddenAlbumContext *context = nil;
     @try {
         id collection = ContainerCollectionFromIvars(dataSource);
         if (collection == nil) {
             collection = [dataSource valueForKey:@"containerCollection"];
         }
-        hidden = IsHiddenSmartAlbum(collection);
+        if (IsHiddenSmartAlbum(collection)) {
+            context = [HAHiddenAlbumContext new];
+            context.collection = collection;
+        }
     } @catch (NSException *exception) {
         (void)exception;
+    } @finally {
+        gResolvingDataSource = NO;
     }
-    gResolvingDataSource = NO;
-    objc_setAssociatedObject(dataSource, &kHiddenDataSourceKey, @(hidden),
+    objc_setAssociatedObject(dataSource, &kHiddenDataSourceKey, context ?: [NSNull null],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return hidden;
+    return context;
+}
+
+static BOOL HiddenAlbumIsNativelyUnlocked(HAHiddenAlbumContext *context) {
+    // The native privacy controller is UI state. Background data-source work
+    // must keep Photos' original model and must not create a UI controller.
+    if (context == nil || ![NSThread isMainThread]) {
+        return NO;
+    }
+    PXContentPrivacyController *privacy = context.privacyController;
+    if (privacy == nil) {
+        Class cls = objc_getClass("PXContentPrivacyController");
+        if (![cls respondsToSelector:@selector(privacyControllerForCollection:)]) {
+            return NO;  // Unknown API: leave Photos' normal protected flow intact.
+        }
+        gResolvingDataSource = YES;
+        @try {
+            privacy = [cls privacyControllerForCollection:context.collection];
+        } @catch (NSException *exception) {
+            (void)exception;
+            return NO;
+        } @finally {
+            gResolvingDataSource = NO;
+        }
+        if (![privacy respondsToSelector:@selector(isLocked)]) {
+            return NO;
+        }
+        context.privacyController = privacy;
+    }
+    // Do not cache this value: a cancelled challenge or native relock must take
+    // effect on the very next count. Never invoke unlock or change a lock flag.
+    return ![privacy isLocked];
 }
 
 static long (*OriginalNumberOfSections)(id, SEL);
@@ -167,10 +219,12 @@ static void InstallVideoPlayerHooks(void);
 
 static long HookedNumberOfSections(id self, SEL _cmd) {
     InstallVideoPlayerHooks();  // PhotosUICore is loaded by the time a count comes
-    if (gHideHiddenAlbum && DataSourceIsHiddenAlbum(self)) {
-        return 0;  // No sections: Photos draws its own "无照片或视频".
+    long sections = OriginalNumberOfSections(self, _cmd);
+    if (gHideHiddenAlbum && !gResolvingDataSource &&
+        HiddenAlbumIsNativelyUnlocked(HiddenAlbumContextForDataSource(self))) {
+        return 0;  // Empty only after Photos' own privacy controller is unlocked.
     }
-    return OriginalNumberOfSections(self, _cmd);
+    return sections;
 }
 
 #pragma mark - 人物与地点 in the Albums tab
