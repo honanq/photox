@@ -8,7 +8,7 @@
 // HiddenAlbumSettings pane and lives in the com.simon.hidden-album domain.
 //
 // Nine hooks, each on the class that implements the method:
-//   -[PXPhotosDataSource numberOfSections]                    the Hidden album
+//   -[PXPhotosViewModel _updateEmptyPlaceholderState]          the Hidden album
 //   -[PXGadgetUIViewController collectionView:numberOfItemsInSection:]      \
 //   -[PXGadgetUIViewController collectionView:layout:referenceSize...:]      / 人物与地点
 //   -[PUAlbumsGadgetProvider gadgets]                          the album list
@@ -109,122 +109,106 @@ static BOOL IsHiddenSmartAlbum(PHAssetCollection *collection) {
            collection.assetCollectionSubtype == PHAssetCollectionSubtypeSmartAlbumAllHidden;
 }
 
-// Read only Photos' own lock state. Authentication, cancellation, relocking,
-// and the protected "使用面容查看" presentation remain entirely native.
+// Only presentation changes. Photos retains its real data source, native
+// authentication challenge, cancellation handling, and relocking behavior.
 @interface PXContentPrivacyController : NSObject
-+ (instancetype)privacyControllerForCollection:(id)collection;
 - (BOOL)isLocked;
+- (id)assetCollectionToObserve;
 @end
 
-@interface HAHiddenAlbumContext : NSObject
-@property (nonatomic, strong) PHAssetCollection *collection;
-// Photos owns its controller. A teardown must not leave us using an old,
-// retained controller whose lock state no longer belongs to the native UI.
+@interface PXPhotosViewModel : NSObject
+- (PXContentPrivacyController *)privacyController;
+- (void)_updateEmptyPlaceholderState;
+@property (nonatomic) NSInteger emptyPlaceholderState;
+@property (nonatomic) NSInteger footerVisibilityStyle;
+@property (nonatomic) BOOL wantsFooterVisible;
+@end
+
+@interface HAHiddenAlbumPresentationState : NSObject
 @property (nonatomic, weak) PXContentPrivacyController *privacyController;
+@property (nonatomic, strong) id collection;
+@property (nonatomic) BOOL hiddenAlbum;
+@property (nonatomic) BOOL footerSuppressed;
+@property (nonatomic) NSInteger savedFooterVisibilityStyle;
 @end
 
-@implementation HAHiddenAlbumContext
+@implementation HAHiddenAlbumPresentationState
 @end
 
-// Cache collection identity, never authorization. Reading the collection must
-// not rely on an unguarded count: -containerCollection may ask for the count
-// again. The reentrant call always receives the original implementation.
-static char kHiddenDataSourceKey;
-static __thread BOOL gResolvingDataSource = NO;
+static char kHiddenPresentationStateKey;
 
-static id ContainerCollectionFromIvars(id dataSource) {
-    for (Class cls = object_getClass(dataSource); cls != Nil; cls = class_getSuperclass(cls)) {
-        for (NSString *name in @[@"_containerCollection", @"_assetCollection", @"_collection"]) {
-            Ivar ivar = class_getInstanceVariable(cls, name.UTF8String);
-            if (ivar == NULL) {
-                continue;
-            }
-            const char *type = ivar_getTypeEncoding(ivar);
-            if (type == NULL || type[0] != '@') {
-                continue;
-            }
-            id value = object_getIvar(dataSource, ivar);
-            if (value != nil) {
-                return value;
-            }
+// The native iOS 17 implementation uses 0 for content, 1 for locked, 2 for
+// loading, and 3 for empty. Its state setter publishes the same change that
+// PXPhotosUIViewController consumes to build the system empty configuration.
+static const NSInteger HAEmptyPlaceholderStateEmpty = 3;
+static const NSInteger HAFooterVisibilityStyleNever = 0;
+
+static void HARestoreFooter(PXPhotosViewModel *model,
+                            HAHiddenAlbumPresentationState *state) {
+    if (state.footerSuppressed) {
+        if (model.footerVisibilityStyle == HAFooterVisibilityStyleNever) {
+            model.footerVisibilityStyle = state.savedFooterVisibilityStyle;
         }
+        state.footerSuppressed = NO;
     }
-    return nil;
 }
 
-static HAHiddenAlbumContext *HiddenAlbumContextForDataSource(id dataSource) {
-    if (gResolvingDataSource) {
-        return nil;
-    }
-    id cached = objc_getAssociatedObject(dataSource, &kHiddenDataSourceKey);
-    if (cached != nil) {
-        return cached == [NSNull null] ? nil : cached;
-    }
-
-    gResolvingDataSource = YES;
-    HAHiddenAlbumContext *context = nil;
-    @try {
-        id collection = ContainerCollectionFromIvars(dataSource);
-        if (collection == nil) {
-            collection = [dataSource valueForKey:@"containerCollection"];
-        }
-        if (IsHiddenSmartAlbum(collection)) {
-            context = [HAHiddenAlbumContext new];
-            context.collection = collection;
-        }
-    } @catch (NSException *exception) {
-        (void)exception;
-    } @finally {
-        gResolvingDataSource = NO;
-    }
-    objc_setAssociatedObject(dataSource, &kHiddenDataSourceKey, context ?: [NSNull null],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return context;
-}
-
-static BOOL HiddenAlbumIsNativelyUnlocked(HAHiddenAlbumContext *context) {
-    // The native privacy controller is UI state. Background data-source work
-    // must keep Photos' original model and must not create a UI controller.
-    if (context == nil || ![NSThread isMainThread]) {
-        return NO;
-    }
-    PXContentPrivacyController *privacy = context.privacyController;
-    if (privacy == nil) {
-        Class cls = objc_getClass("PXContentPrivacyController");
-        if (![cls respondsToSelector:@selector(privacyControllerForCollection:)]) {
-            return NO;  // Unknown API: leave Photos' normal protected flow intact.
-        }
-        gResolvingDataSource = YES;
-        @try {
-            privacy = [cls privacyControllerForCollection:context.collection];
-        } @catch (NSException *exception) {
-            (void)exception;
-            return NO;
-        } @finally {
-            gResolvingDataSource = NO;
-        }
-        if (![privacy respondsToSelector:@selector(isLocked)]) {
-            return NO;
-        }
-        context.privacyController = privacy;
-    }
-    // Do not cache this value: a cancelled challenge or native relock must take
-    // effect on the very next count. Never invoke unlock or change a lock flag.
-    return ![privacy isLocked];
-}
-
-static long (*OriginalNumberOfSections)(id, SEL);
-
+static void (*OriginalUpdateEmptyPlaceholderState)(id, SEL);
 static void InstallVideoPlayerHooks(void);
 
-static long HookedNumberOfSections(id self, SEL _cmd) {
-    InstallVideoPlayerHooks();  // PhotosUICore is loaded by the time a count comes
-    long sections = OriginalNumberOfSections(self, _cmd);
-    if (gHideHiddenAlbum && !gResolvingDataSource &&
-        HiddenAlbumIsNativelyUnlocked(HiddenAlbumContextForDataSource(self))) {
-        return 0;  // Empty only after Photos' own privacy controller is unlocked.
+static void HookedUpdateEmptyPlaceholderState(id self, SEL _cmd) {
+    InstallVideoPlayerHooks();
+    OriginalUpdateEmptyPlaceholderState(self, _cmd);
+    if (![NSThread isMainThread]) {
+        return;
     }
-    return sections;
+
+    PXPhotosViewModel *model = (PXPhotosViewModel *)self;
+    HAHiddenAlbumPresentationState *state =
+        objc_getAssociatedObject(model, &kHiddenPresentationStateKey);
+    if (!gHideHiddenAlbum) {
+        HARestoreFooter(model, state);
+        return;
+    }
+
+    // Read the controller already owned by this exact view model. Never create
+    // a different privacy controller or cache whether authentication succeeded.
+    PXContentPrivacyController *privacy = [model privacyController];
+    id collection = [privacy assetCollectionToObserve];
+    if (privacy == nil || collection == nil) {
+        HARestoreFooter(model, state);
+        return;
+    }
+    if (state == nil) {
+        state = [HAHiddenAlbumPresentationState new];
+        objc_setAssociatedObject(model, &kHiddenPresentationStateKey, state,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (state.privacyController != privacy || state.collection != collection) {
+        state.privacyController = privacy;
+        state.collection = collection;
+        state.hiddenAlbum = IsHiddenSmartAlbum(collection);
+    }
+    if (!state.hiddenAlbum || [privacy isLocked]) {
+        // Keep the original protected presentation, including its unlock button.
+        HARestoreFooter(model, state);
+        return;
+    }
+
+    if (model.emptyPlaceholderState != HAEmptyPlaceholderStateEmpty) {
+        model.emptyPlaceholderState = HAEmptyPlaceholderStateEmpty;
+    }
+    NSInteger footerStyle = model.footerVisibilityStyle;
+    if (!state.footerSuppressed || footerStyle != HAFooterVisibilityStyleNever) {
+        state.savedFooterVisibilityStyle = footerStyle;
+        state.footerSuppressed = YES;
+    }
+    if (footerStyle != HAFooterVisibilityStyleNever) {
+        model.footerVisibilityStyle = HAFooterVisibilityStyleNever;
+    }
+    if (model.wantsFooterVisible) {
+        model.wantsFooterVisible = NO;
+    }
 }
 
 #pragma mark - 人物与地点 in the Albums tab
@@ -763,8 +747,29 @@ __attribute__((constructor)) static void TweakInitialize(void) {
         InstallVideoPlayerHooks();
     }];
 
-    HookSelector(objc_getClass("PXPhotosDataSource"), @selector(numberOfSections),
-                 (IMP)HookedNumberOfSections, (IMP *)&OriginalNumberOfSections);
+    // These private interfaces are checked once, outside the update path. An
+    // unfamiliar Photos version keeps its original protected presentation.
+    Class photosViewModel = objc_getClass("PXPhotosViewModel");
+    Class privacyController = objc_getClass("PXContentPrivacyController");
+    BOOL supportsHiddenPresentation = photosViewModel != Nil && privacyController != Nil;
+    SEL modelSelectors[] = {
+        @selector(_updateEmptyPlaceholderState), @selector(privacyController),
+        @selector(emptyPlaceholderState), @selector(setEmptyPlaceholderState:),
+        @selector(footerVisibilityStyle), @selector(setFooterVisibilityStyle:),
+        @selector(wantsFooterVisible), @selector(setWantsFooterVisible:)
+    };
+    for (NSUInteger i = 0; supportsHiddenPresentation &&
+         i < sizeof(modelSelectors) / sizeof(modelSelectors[0]); i++) {
+        supportsHiddenPresentation =
+            [photosViewModel instancesRespondToSelector:modelSelectors[i]];
+    }
+    if (supportsHiddenPresentation &&
+        [privacyController instancesRespondToSelector:@selector(assetCollectionToObserve)] &&
+        [privacyController instancesRespondToSelector:@selector(isLocked)]) {
+        HookSelector(photosViewModel, @selector(_updateEmptyPlaceholderState),
+                     (IMP)HookedUpdateEmptyPlaceholderState,
+                     (IMP *)&OriginalUpdateEmptyPlaceholderState);
+    }
 
     Class gadgetController = objc_getClass("PXGadgetUIViewController");
     HookSelector(gadgetController, @selector(collectionView:numberOfItemsInSection:),
