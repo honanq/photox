@@ -159,7 +159,10 @@ static BOOL DataSourceIsHiddenAlbum(id dataSource) {
 
 static long (*OriginalNumberOfSections)(id, SEL);
 
+static void InstallVideoPlayerHooks(void);
+
 static long HookedNumberOfSections(id self, SEL _cmd) {
+    InstallVideoPlayerHooks();  // PhotosUICore is loaded by the time a count comes
     if (gHideHiddenAlbum && DataSourceIsHiddenAlbum(self)) {
         return 0;  // No sections: Photos draws its own "无照片或视频".
     }
@@ -519,36 +522,76 @@ static void HookedPresentViewController(id self, SEL _cmd, UIViewController *vie
 
 #pragma mark - Sound when a video plays
 
-// PUBrowsingVideoPlayer is the viewer's video model: play/pause reaches it as
-// -setDesiredPlayState:, and muting as -setMuted:. Playing always starts with the
-// sound on when the pane asks for it; muting while playing still works, and
-// playing again turns the sound back on.
+// The viewer's video model. Its own mute button drives `isMuted` (through -setMuted:),
+// and Photos mutes a newly created player by itself. The first such request of each
+// player is dropped, which is what leaves a video starting with sound; everything after
+// that goes through unchanged, so the mute button keeps working.
 @interface PUBrowsingVideoPlayer : NSObject
-- (void)setMuted:(BOOL)muted;
-- (void)setDesiredPlayState:(long long)state;
+@property (nonatomic) BOOL isMuted;
+@property (nonatomic) long long desiredPlayState;
+@property (readonly, nonatomic) long long playState;
 @end
 
-static void (*OriginalSetDesiredPlayState)(id, SEL, long long);
+static void (*OriginalSetMuted)(id, SEL, BOOL);
 
-static void HookedSetDesiredPlayState(id self, SEL _cmd, long long state) {
-    OriginalSetDesiredPlayState(self, _cmd, state);
-    if (!gAutoUnmuteVideo) {
+// Set as soon as the user uses the mute button; from then on this video's mute requests
+// are the user's and are applied as they come.
+static BOOL gUserTouchedMute = NO;
+
+static void HookedSetMuted(id self, SEL _cmd, BOOL muted) {
+    // Photos mutes a video by itself while it starts (several times). Those requests are
+    // applied as "not muted" so the video starts with sound and Photos' own state agrees;
+    // once the user has pressed the mute button, everything is passed through untouched.
+    BOOL automatic = gAutoUnmuteVideo && muted && !gUserTouchedMute;
+    OriginalSetMuted(self, _cmd, automatic ? NO : muted);
+}
+
+static void (*OriginalPerformMuteAction)(id, SEL, BOOL);
+
+static void HookedPerformMuteAction(id self, SEL _cmd, BOOL muted) {
+    gUserTouchedMute = YES;
+    OriginalPerformMuteAction(self, _cmd, muted);
+}
+
+
+// PUBrowsingVideoPlayer lives in PhotosUICore, which is not loaded yet when this tweak
+// is injected, so its hook goes in as soon as the class is there: on activation, when
+// the viewer appears, and when the play button is used.
+static void (*OriginalTogglePlayback)(id, SEL);
+
+static void InstallVideoPlayerHooks(void) {
+    static BOOL installed = NO;
+    if (installed) {
         return;
     }
-    BOOL wanted = NO;
-    @try {
-        wanted = [[(PUBrowsingVideoPlayer *)self valueForKey:@"isPlaybackDesired"] boolValue];
-    } @catch (NSException *exception) {
-        (void)exception;
-        return;
+    Class player = objc_getClass("PUBrowsingVideoPlayer");
+    if (player == Nil) {
+        return;  // not loaded yet; a later call tries again
     }
-    if (wanted) {
-        @try {
-            [(PUBrowsingVideoPlayer *)self setMuted:NO];
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
-    }
+    MSHookMessageEx(player, @selector(setMuted:),
+                    (IMP)HookedSetMuted, (IMP *)&OriginalSetMuted);
+    installed = YES;
+}
+
+static void HookedTogglePlayback(id self, SEL _cmd) {
+    InstallVideoPlayerHooks();
+    OriginalTogglePlayback(self, _cmd);
+}
+
+// A video can start playing by itself (autoplay), before the viewer has appeared:
+// the hooks go in as early as the viewer's viewWillAppear, and again on appear.
+static void (*OriginalOneUpViewWillAppear)(id, SEL, BOOL);
+static void (*OriginalOneUpViewDidAppear)(id, SEL, BOOL);
+
+static void HookedOneUpViewWillAppear(id self, SEL _cmd, BOOL animated) {
+    gUserTouchedMute = NO;  // a video newly opened: its own start mutes are automatic
+    InstallVideoPlayerHooks();
+    OriginalOneUpViewWillAppear(self, _cmd, animated);
+}
+
+static void HookedOneUpViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    OriginalOneUpViewDidAppear(self, _cmd, animated);
+    InstallVideoPlayerHooks();
 }
 
 #pragma mark - Hooks
@@ -577,6 +620,7 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                 usingBlock:^(NSNotification *note) {
         (void)note;
         ReadSettings();
+        InstallVideoPlayerHooks();
     }];
 
     HookSelector(objc_getClass("PXPhotosDataSource"), @selector(numberOfSections),
@@ -598,7 +642,15 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     HookSelector(objc_getClass("PUOneUpViewController"),
                  @selector(presentViewController:animated:completion:),
                  (IMP)HookedPresentViewController, (IMP *)&OriginalPresentViewController);
+    HookSelector(objc_getClass("PUOneUpViewController"), @selector(togglePlayback:),
+                 (IMP)HookedTogglePlayback, (IMP *)&OriginalTogglePlayback);
+    HookSelector(objc_getClass("PUOneUpViewController"), @selector(viewWillAppear:),
+                 (IMP)HookedOneUpViewWillAppear, (IMP *)&OriginalOneUpViewWillAppear);
+    HookSelector(objc_getClass("PUOneUpViewController"), @selector(viewDidAppear:),
+                 (IMP)HookedOneUpViewDidAppear, (IMP *)&OriginalOneUpViewDidAppear);
 
-    HookSelector(objc_getClass("PUBrowsingVideoPlayer"), @selector(setDesiredPlayState:),
-                 (IMP)HookedSetDesiredPlayState, (IMP *)&OriginalSetDesiredPlayState);
+    HookSelector(objc_getClass("PUOneUpBarsController"), @selector(_performMuteAction:),
+                 (IMP)HookedPerformMuteAction, (IMP *)&OriginalPerformMuteAction);
+
+    InstallVideoPlayerHooks();
 }
