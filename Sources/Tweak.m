@@ -9,9 +9,10 @@
 //
 // Nine possible hook targets, enabled as needed on these concrete classes:
 //   -[PXPhotosViewModel setEmptyPlaceholderState:]             the Hidden album
+//   -[PXPhotosUIViewController _updateContentUnavailableConfigurationUsingState:]
+//                                                              the Hidden grid
 //   -[PXGadgetUIViewController collectionView:numberOfItemsInSection:]      \
 //   -[PXGadgetUIViewController collectionView:layout:referenceSize...:]      / 人物与地点
-//   -[PUAlbumsGadgetProvider gadgets]                          the album list
 //   -[PUDoubleHeightHorizontalAlbumListGadgetLayout layoutAttributesForItemAtIndexPath:]
 //                                                              hidden album cards
 //   -[PUOneUpViewController presentViewController:animated:completion:]
@@ -30,6 +31,7 @@
 #import <stdatomic.h>
 
 #import "ApelinBootstrap.h"
+#import "HAAlbumInventory.h"
 
 #pragma mark - The settings
 
@@ -43,10 +45,8 @@ static BOOL gAutoUnmuteVideo = NO;
 static BOOL gLoaded = NO;
 static BOOL gRestartScheduled = NO;
 static NSUInteger gSettingsGeneration = 0;
-static NSUInteger gInventoryObservationGeneration = 0;
 static NSDictionary<NSString *, NSNumber *> *gHiddenAlbumFlags = nil;
 static void InstallConfiguredHooks(void);
-static dispatch_queue_t AlbumInventoryQueue(void);
 
 static NSUserDefaults *Preferences(void) {
     static NSUserDefaults *defaults;
@@ -71,7 +71,6 @@ static BOOL AlbumIsHidden(PHAssetCollection *collection) {
 }
 
 static void ReadSettings(void) {
-    gInventoryObservationGeneration++;
     NSDictionary *snapshot = [Preferences() dictionaryRepresentation];
     BOOL album = BoolFromSnapshot(snapshot, @"enabled", YES);
     BOOL peopleAndPlaces = BoolFromSnapshot(snapshot, @"hidePeoplePlaces", YES);
@@ -98,11 +97,9 @@ static void ReadSettings(void) {
 
     if (restart && !gRestartScheduled) {
         gRestartScheduled = YES;
-        // Drain previously queued inventory writes before leaving, without
-        // blocking Photos' main thread or scheduling a timer.
-        dispatch_async(AlbumInventoryQueue(), ^{
-            dispatch_async(dispatch_get_main_queue(), ^{ exit(0); });
-        });
+        // Reject new refreshes and drain any in-flight inventory commit before
+        // leaving, without blocking Photos' main thread or scheduling a timer.
+        HAStopAlbumInventory(^{ exit(0); });
     }
 }
 
@@ -419,26 +416,11 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
     return OriginalHeaderSize(self, _cmd, collectionView, layout, section);
 }
 
-#pragma mark - The albums the pane lists
+#pragma mark - The album cards' collection identity
 
-// The pane runs in Settings, which cannot read the photo library, so the album
-// list is gathered from the album cards Photos itself builds and published to
-// the preferences domain the pane reads.
 @interface PUAlbumGadget : NSObject
 - (PHAssetCollection *)collection;
 @end
-
-@interface HAAlbumProviderSnapshot : NSObject
-@property (nonatomic, weak) NSArray *gadgets;
-@property (nonatomic) NSUInteger count;
-@property (nonatomic) NSUInteger observationGeneration;
-@property (nonatomic) BOOL complete;
-@property (nonatomic, copy) NSArray<NSDictionary *> *inventory;
-@end
-@implementation HAAlbumProviderSnapshot
-@end
-
-static char kProviderSnapshotKey;
 
 static id DisplayCollectionOfGadget(id gadget) {
     id collection = nil;
@@ -455,127 +437,6 @@ static id DisplayCollectionOfGadget(id gadget) {
 static PHAssetCollection *CollectionOfGadget(id gadget) {
     id collection = DisplayCollectionOfGadget(gadget);
     return [collection isKindOfClass:[PHAssetCollection class]] ? collection : nil;
-}
-
-static dispatch_queue_t AlbumInventoryQueue(void) {
-    static dispatch_queue_t queue;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        queue = dispatch_queue_create(APELIN_PACKAGE_ID ".inventory", DISPATCH_QUEUE_SERIAL);
-    });
-    return queue;
-}
-
-// Main-thread state describes the latest request, not a guaranteed disk commit.
-// A failed latest synchronization permits a retry on the next provider event.
-static NSArray<NSDictionary *> *gRequestedInventory;
-static NSUInteger gInventoryRequestGeneration;
-
-static NSArray<NSDictionary *> *QueueAlbumInventory(NSArray<NSDictionary *> *albums) {
-    if (albums == nil || gRestartScheduled) {
-        return albums;
-    }
-    if (gRequestedInventory == albums || [gRequestedInventory isEqualToArray:albums]) {
-        return gRequestedInventory;
-    }
-    gRequestedInventory = [albums copy];
-    NSArray *inventory = gRequestedInventory;
-    NSUInteger generation = ++gInventoryRequestGeneration;
-    // Preserve the original last-provider-wins order without synchronizing
-    // cfprefsd on the UI thread. Equal provider snapshots share the same array.
-    dispatch_async(AlbumInventoryQueue(), ^{
-        CFPreferencesSetAppValue(CFSTR("albumInventory"),
-                                 (__bridge CFPropertyListRef)inventory,
-                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID);
-        if (CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID)) {
-            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/inventoryChanged"), NULL, NULL, true);
-        } else {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (generation == gInventoryRequestGeneration) {
-                    gRequestedInventory = nil;
-                }
-            });
-        }
-    });
-    return inventory;
-}
-
-// Parse only a changed provider snapshot, but publish its cached inventory even
-// on a cache hit when a different provider most recently supplied the pane.
-static void RecordAlbumsInGadgets(id provider, NSArray *gadgets) {
-    HAAlbumProviderSnapshot *snapshot =
-        objc_getAssociatedObject(provider, &kProviderSnapshotKey);
-    BOOL sameSnapshot = snapshot != nil && snapshot.gadgets == gadgets &&
-                        snapshot.count == gadgets.count;
-    if (sameSnapshot && (snapshot.complete ||
-        snapshot.observationGeneration == gInventoryObservationGeneration)) {
-        if (snapshot.complete) {
-            snapshot.inventory = QueueAlbumInventory(snapshot.inventory);
-        }
-        return;
-    }
-    if (snapshot == nil) {
-        snapshot = [HAAlbumProviderSnapshot new];
-        objc_setAssociatedObject(provider, &kProviderSnapshotKey, snapshot,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    BOOL previouslyLoaded = snapshot.inventory != nil;
-    snapshot.gadgets = gadgets;
-    snapshot.count = gadgets.count;
-    snapshot.observationGeneration = gInventoryObservationGeneration;
-    snapshot.complete = NO;
-    if (gadgets.count == 0) {
-        // An initially empty provider may still be loading. A previously valid
-        // provider becoming empty can clear its own stale inventory.
-        if (previouslyLoaded) {
-            snapshot.complete = YES;
-            snapshot.inventory = QueueAlbumInventory(@[]);
-        }
-        return;
-    }
-    BOOL incomplete = NO;
-    NSMutableArray<NSDictionary *> *albums = [NSMutableArray arrayWithCapacity:gadgets.count];
-    NSMutableSet<NSString *> *seen = [NSMutableSet setWithCapacity:gadgets.count];
-    for (id gadget in gadgets) {
-        id displayedCollection = DisplayCollectionOfGadget(gadget);
-        if (![displayedCollection isKindOfClass:[PHAssetCollection class]]) {
-            if (displayedCollection == nil && [gadget respondsToSelector:@selector(collection)]) {
-                incomplete = YES;
-            }
-            continue;  // Folder and utility cards are not per-album switches.
-        }
-        PHAssetCollection *collection = displayedCollection;
-        NSString *identifier = collection.localIdentifier;
-        NSString *title = collection.localizedTitle;
-        if (identifier.length == 0 || title.length == 0) {
-            incomplete = YES;
-            continue;
-        }
-        if ([seen containsObject:identifier]) {
-            continue;
-        }
-        // People and Places have their own switch above; they are not albums here.
-        if (TitleIsPeopleAndPlaces(title)) {
-            continue;
-        }
-        [seen addObject:identifier];
-        [albums addObject:@{@"id": identifier, @"title": title}];
-    }
-    if (!incomplete && albums.count != 0) {
-        snapshot.complete = YES;
-        snapshot.inventory = QueueAlbumInventory(albums);
-    }
-}
-
-static NSArray *(*OriginalGadgetProviderGadgets)(id, SEL);
-
-static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
-    NSArray *gadgets = OriginalGadgetProviderGadgets(self, _cmd);
-    if ([NSThread isMainThread] && [gadgets isKindOfClass:[NSArray class]]) {
-        RecordAlbumsInGadgets(self, gadgets);
-    }
-    return gadgets;
 }
 
 #pragma mark - The album cards
@@ -1000,9 +861,6 @@ static void InstallConfiguredHooks(void) {
                        @selector(collectionView:layout:referenceSizeForHeaderInSection:),
                        (IMP)HookedHeaderSize, (IMP *)&OriginalHeaderSize, NO, &waiting);
     }
-    // Inventory is needed by the settings pane even when no cards are hidden.
-    HookNamedClass("PUAlbumsGadgetProvider", @selector(gadgets),
-                   (IMP)HookedGadgetProviderGadgets, (IMP *)&OriginalGadgetProviderGadgets, NO, &waiting);
     if (gHiddenAlbumFlags.count != 0) {
         HookNamedClass("PUDoubleHeightHorizontalAlbumListGadgetLayout",
                        @selector(layoutAttributesForItemAtIndexPath:),
@@ -1043,6 +901,8 @@ __attribute__((constructor)) static void TweakInitialize(void) {
            APELIN_BUILD_ID, getprogname());
 
     ReadSettings();
+    // The worker opens PhotoKit only after the host's startup, off main.
+    dispatch_async(dispatch_get_main_queue(), ^{ HAStartAlbumInventory(); });
     _dyld_register_func_for_add_image(HAImageAdded);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     SettingChangedCallback,
@@ -1055,5 +915,6 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                 usingBlock:^(NSNotification *note) {
         (void)note;
         ReadSettings();
+        HARefreshAlbumInventory();
     }];
 }

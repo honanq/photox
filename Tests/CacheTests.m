@@ -19,10 +19,6 @@
 @end
 
 static Class HATestGetClass(const char *name);
-static void HATestSetPreference(CFStringRef key, CFPropertyListRef value, CFStringRef domain);
-static Boolean HATestSynchronize(CFStringRef domain);
-static void HATestInventoryNotification(CFNotificationCenterRef center, CFNotificationName name,
-                                       const void *object, CFDictionaryRef info, Boolean deliver);
 
 // All system headers are imported first. Suppress only the source constructor;
 // the test includes the actual production functions, not copies of their logic.
@@ -30,9 +26,6 @@ static void HATestInventoryNotification(CFNotificationCenterRef center, CFNotifi
 #define PHAssetCollection HATestCollection
 #define PUHorizontalAlbumListGadget HATestAlbumList
 #define objc_getClass HATestGetClass
-#define CFPreferencesSetAppValue HATestSetPreference
-#define CFPreferencesAppSynchronize HATestSynchronize
-#define CFNotificationCenterPostNotification HATestInventoryNotification
 #define APELIN_PACKAGE_ID "local.apelin.synthetic-cache-tests"
 #define APELIN_BUILD_ID "synthetic-test"
 #import "../Sources/Tweak.m"
@@ -40,25 +33,16 @@ static void HATestInventoryNotification(CFNotificationCenterRef center, CFNotifi
 #undef PHAssetCollection
 #undef PUHorizontalAlbumListGadget
 #undef objc_getClass
-#undef CFPreferencesSetAppValue
-#undef CFPreferencesAppSynchronize
-#undef CFNotificationCenterPostNotification
+
+// The metadata worker has its own isolated tests; never start it in this suite.
+void HAStartAlbumInventory(void) {}
+void HARefreshAlbumInventory(void) {}
+void HAStopAlbumInventory(dispatch_block_t completion) { (void)completion; }
 
 static NSUInteger gAssertions;
 static NSUInteger gFailures;
 static NSUInteger gCollectionReads;
 static NSUInteger gHookCalls;
-static NSUInteger gWrites;              // Accessed on inventory queue only.
-static BOOL gSynchronizationSucceeds = YES;
-static NSArray *gSavedInventory;
-static NSUInteger gInventoryNotifications;
-
-static void HATestInventoryNotification(CFNotificationCenterRef center, CFNotificationName name,
-                                       const void *object, CFDictionaryRef info, Boolean deliver) {
-    (void)center; (void)object; (void)info; (void)deliver;
-    NSCAssert(CFEqual(name, CFSTR(APELIN_PACKAGE_ID "/inventoryChanged")), @"Unexpected signal");
-    gInventoryNotifications++;
-}
 
 static void CHECK(BOOL condition, const char *label) {
     gAssertions++;
@@ -68,20 +52,6 @@ static void CHECK(BOOL condition, const char *label) {
 void MSHookMessageEx(Class cls, SEL selector, IMP replacement, IMP *original) {
     (void)cls; (void)selector; (void)replacement; (void)original;
     gHookCalls++;
-}
-
-static void HATestSetPreference(CFStringRef key, CFPropertyListRef value, CFStringRef domain) {
-    NSCAssert(CFEqual(key, CFSTR("albumInventory")), @"Unexpected test key");
-    NSCAssert(CFEqual(domain, CFSTR(APELIN_PACKAGE_ID)), @"Unexpected domain");
-    gWrites++;
-    gSavedInventory = [(__bridge NSArray *)value copy];
-}
-static Boolean HATestSynchronize(CFStringRef domain) {
-    NSCAssert(CFEqual(domain, CFSTR(APELIN_PACKAGE_ID)), @"Unexpected domain");
-    return gSynchronizationSucceeds;
-}
-static void DrainInventory(void) {
-    dispatch_sync(AlbumInventoryQueue(), ^{});
 }
 
 @interface HATestGadget : NSObject
@@ -533,97 +503,15 @@ static void TestHiddenGridPresentation(void) {
     gHideHiddenAlbum = YES;
 }
 
-static void TestInventory(void) {
-    NSObject *providerA = [NSObject new], *providerB = [NSObject new];
-    NSArray *albumsA = @[Gadget(@"SYNTHETIC-A"), Gadget(@"SYNTHETIC-B")];
-    NSArray *albumsB = @[Gadget(@"SYNTHETIC-C")];
-    RecordAlbumsInGadgets(providerA, albumsA);
-    DrainInventory();
-    CHECK(gWrites == 1 && gSavedInventory.count == 2, "initial synthetic inventory queued once");
-    NSUInteger reads = gCollectionReads;
-    for (NSUInteger i = 0; i < 10000; i++) RecordAlbumsInGadgets(providerA, albumsA);
-    DrainInventory();
-    CHECK(gCollectionReads == reads && gWrites == 1, "10000 inventory hits neither rescan nor rewrite");
-    RecordAlbumsInGadgets(providerB, albumsB);
-    DrainInventory();
-    CHECK(gWrites == 2 && gSavedInventory.count == 1, "different provider can publish");
-    reads = gCollectionReads;
-    RecordAlbumsInGadgets(providerA, albumsA);
-    DrainInventory();
-    CHECK(gWrites == 3 && gSavedInventory.count == 2 && gCollectionReads == reads,
-          "returning cached provider republishes without rescanning");
-    RecordAlbumsInGadgets(providerB, @[Gadget(@"SYNTHETIC-A"), Gadget(@"SYNTHETIC-B")]);
-    DrainInventory();
-    CHECK(gWrites == 3, "equal inventory across providers does not rewrite");
-    HAAlbumProviderSnapshot *snapshot = objc_getAssociatedObject(providerB, &kProviderSnapshotKey);
-    CHECK(snapshot.inventory == gRequestedInventory, "equal inventory uses canonical cached array");
-    CHECK(gInventoryNotifications == 3, "successful writes publish one inventory signal each");
-
-    NSObject *pendingProvider = [NSObject new];
-    HATestGadget *pending = Gadget(@"SYNTHETIC-PENDING");
-    pending.testCollection.localizedTitle = nil;
-    NSArray *pendingArray = @[pending];
-    NSUInteger beforePending = gWrites;
-    RecordAlbumsInGadgets(pendingProvider, pendingArray);
-    DrainInventory();
-    CHECK(gWrites == beforePending && gSavedInventory.count == 2,
-          "unready title never overwrites last valid inventory");
-    reads = gCollectionReads;
-    for (NSUInteger i = 0; i < 10000; i++) RecordAlbumsInGadgets(pendingProvider, pendingArray);
-    CHECK(gCollectionReads == reads, "10000 unready snapshot hits never rescan in same lifecycle");
-    pending.testCollection.localizedTitle = @"Ready";
-    gInventoryObservationGeneration++;
-    RecordAlbumsInGadgets(pendingProvider, pendingArray);
-    DrainInventory();
-    CHECK(gWrites == beforePending + 1 && gSavedInventory.count == 1,
-          "foreground generation retries an unready same-array inventory");
-    RecordAlbumsInGadgets(pendingProvider, @[]);
-    DrainInventory();
-    CHECK(gWrites == beforePending + 2 && gSavedInventory.count == 0,
-          "previously loaded provider can clear its inventory");
-    NSObject *initiallyEmpty = [NSObject new];
-    NSUInteger writesBeforeEmpty = gWrites;
-    RecordAlbumsInGadgets(initiallyEmpty, @[]);
-    DrainInventory();
-    CHECK(gWrites == writesBeforeEmpty, "initial loading provider never publishes an empty inventory");
-
-    NSUInteger writesBeforeFailure = gWrites;
-    NSUInteger signalsBeforeFailure = gInventoryNotifications;
-    gSynchronizationSucceeds = NO;
-    NSArray *failed = @[Gadget(@"SYNTHETIC-RETRY")];
-    RecordAlbumsInGadgets(providerA, failed);
-    DrainInventory();
-    CHECK(gWrites == writesBeforeFailure + 1, "failed synchronization attempted once");
-    CHECK(gInventoryNotifications == signalsBeforeFailure, "failed synchronization never signals success");
-    // The failure callback is already queued on main. Run assertions after it,
-    // without a timer or polling loop, then retry on one explicit provider event.
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            CHECK(gRequestedInventory == nil, "latest failed request invalidates publication cache");
-            gSynchronizationSucceeds = YES;
-            NSUInteger before = gCollectionReads;
-            RecordAlbumsInGadgets(providerA, failed);
-            DrainInventory();
-            CHECK(gWrites == writesBeforeFailure + 2 && gRequestedInventory != nil,
-                  "next natural event retries synchronization");
-            CHECK(gInventoryNotifications == signalsBeforeFailure + 1,
-                  "successful retry publishes one signal");
-            CHECK(gCollectionReads == before, "retry uses parsed provider inventory");
-            CHECK(gHookCalls == 0, "test constructor never installed hooks");
-            printf("Synthetic cache/presentation tests: %lu assertions, %lu failures; five 10000-hit no-scan checks.\n",
-                   (unsigned long)gAssertions, (unsigned long)gFailures);
-            exit(gFailures == 0 ? 0 : 1);
-        }
-    });
-}
-
 int main(void) {
     @autoreleasepool {
         TestCacheAndGeometry();
         TestTitles();
         TestHiddenPresentation();
         TestHiddenGridPresentation();
-        TestInventory();
+        CHECK(gHookCalls == 0, "test constructor never installed hooks");
+        printf("Synthetic cache/presentation tests: %lu assertions, %lu failures; three 10000-hit no-scan checks.\n",
+               (unsigned long)gAssertions, (unsigned long)gFailures);
+        return gFailures == 0 ? 0 : 1;
     }
-    dispatch_main();
 }
