@@ -183,7 +183,7 @@ static long HookedNumberOfSections(id self, SEL _cmd) {
 - (id)_gadgetAtIndexPath:(NSIndexPath *)indexPath;
 @end
 
-static char kPeopleSectionsKey;
+static char kPeopleGadgetKey;
 
 // The title is what tells the 人物与地点 block apart: its gadget is the same class as the
 // album ones, so the class name says nothing.
@@ -198,65 +198,48 @@ static BOOL TitleIsPeopleAndPlaces(NSString *title) {
     return people && places;
 }
 
-// A gadget's title is read once for the whole section list, never once per layout pass.
+// The verdict is kept on the gadget itself: the title is read once, while a section's item
+// count and header size can both ask for it on every layout pass. The gadget is fetched
+// through Photos' own index, never through the collection view, whose section count would
+// call back into this and recurse until the stack ran out.
 static BOOL GadgetIsPeopleAndPlaces(id gadget) {
-    NSString *title = nil;
     @try {
+        NSNumber *cached = objc_getAssociatedObject(gadget, &kPeopleGadgetKey);
+        if (cached != nil) {
+            return cached.boolValue;
+        }
         id value = [gadget valueForKey:@"title"];
         if (![value isKindOfClass:[NSString class]] || [value length] == 0) {
             value = [gadget valueForKey:@"localizedTitle"];
         }
-        if ([value isKindOfClass:[NSString class]]) {
-            title = value;
-        }
+        BOOL verdict = TitleIsPeopleAndPlaces([value isKindOfClass:[NSString class]] ? value : nil);
+        objc_setAssociatedObject(gadget, &kPeopleGadgetKey, @(verdict),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return verdict;
     } @catch (NSException *exception) {
         return NO;
     }
-    return TitleIsPeopleAndPlaces(title);
 }
 
-static NSArray<NSNumber *> *PeopleSectionFlags(id controller, NSInteger sections) {
-    NSMutableArray<NSNumber *> *flags =
-        [NSMutableArray arrayWithCapacity:(NSUInteger)MAX(sections, 0)];
-    for (NSInteger index = 0; index < sections; index++) {
-        id gadget = nil;
-        @try {
-            gadget = [(PXGadgetUIViewController *)controller
-                _gadgetAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:index]];
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
-        [flags addObject:@(gadget != nil && GadgetIsPeopleAndPlaces(gadget))];
-    }
-    return flags;
-}
-
-// Both the item count and the header size of every section ask this, on each layout pass,
-// so the verdicts are kept on the controller and rebuilt only when the section count moves.
-static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section,
-                                     UICollectionView *collectionView) {
-    if (!gHidePeopleAndPlaces || section < 0 || collectionView == nil) {
+static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section) {
+    if (!gHidePeopleAndPlaces || section < 0) {
         return NO;
     }
-    NSInteger sections = (NSInteger)collectionView.numberOfSections;
-    NSDictionary *cached = objc_getAssociatedObject(controller, &kPeopleSectionsKey);
-    NSArray<NSNumber *> *flags = nil;
-    if (cached != nil && [cached[@"sections"] integerValue] == sections) {
-        flags = cached[@"flags"];
-    } else {
-        flags = PeopleSectionFlags(controller, sections);
-        objc_setAssociatedObject(controller, &kPeopleSectionsKey,
-                                 @{@"sections": @(sections), @"flags": flags},
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    id gadget = nil;
+    @try {
+        gadget = [(PXGadgetUIViewController *)controller
+            _gadgetAtIndexPath:[NSIndexPath indexPathForItem:0 inSection:section]];
+    } @catch (NSException *exception) {
+        (void)exception;
     }
-    return (NSUInteger)section < flags.count && flags[(NSUInteger)section].boolValue;
+    return gadget != nil && GadgetIsPeopleAndPlaces(gadget);
 }
 
 static NSInteger (*OriginalGadgetNumberOfItems)(id, SEL, UICollectionView *, NSInteger);
 
 static NSInteger HookedGadgetNumberOfItems(id self, SEL _cmd, UICollectionView *collectionView,
                                            NSInteger section) {
-    if (SectionIsPeopleAndPlaces(self, section, collectionView)) {
+    if (SectionIsPeopleAndPlaces(self, section)) {
         return 0;
     }
     return OriginalGadgetNumberOfItems(self, _cmd, collectionView, section);
@@ -266,7 +249,7 @@ static CGSize (*OriginalHeaderSize)(id, SEL, UICollectionView *, UICollectionVie
 
 static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionView,
                                UICollectionViewLayout *layout, NSInteger section) {
-    if (SectionIsPeopleAndPlaces(self, section, collectionView)) {
+    if (SectionIsPeopleAndPlaces(self, section)) {
         return CGSizeMake(0, 0);
     }
     return OriginalHeaderSize(self, _cmd, collectionView, layout, section);
