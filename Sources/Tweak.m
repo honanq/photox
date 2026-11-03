@@ -522,15 +522,19 @@ static void HookedPresentViewController(id self, SEL _cmd, UIViewController *vie
 
 #pragma mark - Sound when a video plays
 
-// The viewer's video model. Its own mute button drives `isMuted` (through -setMuted:),
-// and Photos mutes a newly created player by itself. The first such request of each
-// player is dropped, which is what leaves a video starting with sound; everything after
-// that goes through unchanged, so the mute button keeps working.
+// Use the actual setter from Photos' interface. Declaring a property named `isMuted`
+// without setter=setMuted: would make a write call the nonexistent setIsMuted:.
+@class PXVideoSession;
 @interface PUBrowsingVideoPlayer : NSObject
-@property (nonatomic) BOOL isMuted;
+@property (nonatomic, getter=isMuted, setter=setMuted:) BOOL muted;
 @property (nonatomic) float volume;
-@property (nonatomic) long long desiredPlayState;
-@property (readonly, nonatomic) long long playState;
+@property (readonly, nonatomic) PXVideoSession *videoSession;
+@end
+
+@interface PUOneUpBarsController : NSObject
+- (void)_performChangesWithCurrentVideoPlayer:(void (^)(PUBrowsingVideoPlayer *player))changes;
+- (void)_setNeedsUpdatePlayPauseItems:(BOOL)needsUpdate;
+- (void)updateBars;
 @end
 
 static void (*OriginalSetMuted)(id, SEL, BOOL);
@@ -580,20 +584,30 @@ static void (*OriginalPerformMuteAction)(id, SEL, BOOL);
 
 static void HookedPerformMuteAction(id self, SEL _cmd, BOOL muted) {
     gUserTouchedMute = YES;
-    PXVideoSession *session = gLastSession;
-    if (gAutoUnmuteVideo && session != nil) {
-        // The audible level here is the session volume, so it is toggled directly; Photos'
-        // own mute state has drifted from the audio and is left alone.
-        static BOOL userMuted = NO;
-        userMuted = !userMuted;
-        @try {
-            [session setVolume:(userMuted ? 0.0f : 1.0f) withFade:YES];
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
+    PUOneUpBarsController *bars = (PUOneUpBarsController *)self;
+    if (!gAutoUnmuteVideo ||
+        ![bars respondsToSelector:@selector(_performChangesWithCurrentVideoPlayer:)] ||
+        ![bars respondsToSelector:@selector(_setNeedsUpdatePlayPauseItems:)] ||
+        ![bars respondsToSelector:@selector(updateBars)]) {
+        OriginalPerformMuteAction(self, _cmd, muted);
         return;
     }
-    OriginalPerformMuteAction(self, _cmd, muted);
+
+    [bars _performChangesWithCurrentVideoPlayer:^(PUBrowsingVideoPlayer *player) {
+        if (player == nil) {
+            return;
+        }
+        PXVideoSession *session = player.videoSession ?: gLastSession;
+        BOOL shouldMute = session != nil ? (session.volume > 0.5f) : !player.isMuted;
+
+        // Publish the matching model state through Photos' change block, then align the
+        // actual session audio. In the previous attempt, dot syntax called missing
+        // setIsMuted: and the swallowed exception left the icon state untouched.
+        [player setMuted:shouldMute];
+        [session setVolume:(shouldMute ? 0.0f : 1.0f) withFade:YES];
+        [bars _setNeedsUpdatePlayPauseItems:YES];
+        [bars updateBars];
+    }];
 }
 
 
