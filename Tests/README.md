@@ -25,7 +25,7 @@ ldid -S.apelin-local/Tool.entitlements .apelin-local/cache-tests
 
 ## 图库清单服务（AlbumInventoryTests.m）
 
-本轮严格编译、签名后执行：185 条断言，0 失败；断言数包含替身边界检查，并非独立场景数。
+本轮严格编译、签名后执行：187 条断言，0 失败；断言数包含替身边界检查，并非独立场景数。
 
 直接包含 Sources/HAAlbumInventory.m，PhotoKit 类、CFPreferences 及 notify 使用内存替身。检查：
 
@@ -34,6 +34,7 @@ ldid -S.apelin-local/Tool.entitlements .apelin-local/cache-tests
 - 每次查询明确绑定宿主库；切库时迁移观察者及查询上下文，不复用旧库的去重快照。
 - 普通相簿及「最近项目 / 个人收藏」元数据、稳定排序、标识去重；不列出不受卡片布局控制的媒体/工具智能分类。
 - nil 标题保留旧标题或使用未命名标签，不阻断全清单；缺失标识不发布部分结果。
+- 归一化先去重后读标题，重复标识保持首项优先；每张智能卡片的类型只读一次。
 - 图库变更直接消费 fetchResultAfterChanges；有效空结果清空旧条目。
 - 相同清单不重复写；失败同步不发通知且清除发布缓存，下一自然事件用候选缓存重试，不重扫。
 - 失败写 B 后返回先前 A 也会重新同步，不能将 cfprefsd 中未同步的 B 当作 A。

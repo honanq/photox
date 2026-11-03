@@ -40,8 +40,9 @@
     if (self) {
         atomic_init(&_stopping, false);
         _requestToken = -1;
-        dispatch_queue_attr_t attributes = dispatch_queue_attr_make_with_qos_class(
-            DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+        dispatch_queue_attr_t attributes = dispatch_queue_attr_make_with_autorelease_frequency(
+            DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
+        attributes = dispatch_queue_attr_make_with_qos_class(attributes, QOS_CLASS_UTILITY, 0);
         _queue = dispatch_queue_create(APELIN_PACKAGE_ID ".inventory", attributes);
         _refreshSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_OR, 0, 0, _queue);
         __weak typeof(self) weakSelf = self;
@@ -118,31 +119,42 @@
     if (self.albums == nil || self.smartAlbums == nil) {
         return;
     }
-    NSMutableDictionary<NSString *, NSString *> *previousTitles = [NSMutableDictionary dictionary];
-    for (NSDictionary *album in previous) previousTitles[album[@"id"]] = album[@"title"];
+    NSMutableDictionary<NSString *, NSString *> *previousTitles = nil;
     NSMutableArray<NSDictionary *> *inventory = [NSMutableArray array];
     NSMutableSet<NSString *> *seen = [NSMutableSet set];
     for (PHFetchResult *result in @[self.albums, self.smartAlbums]) {
+        BOOL smartResult = result == self.smartAlbums;
         for (PHAssetCollection *collection in result) {
             // Other smart collections belong to Media Types/Utilities, not the
             // concrete My Albums card layout our per-album switch controls.
-            if (result == self.smartAlbums &&
-                collection.assetCollectionSubtype != PHAssetCollectionSubtypeSmartAlbumUserLibrary &&
-                collection.assetCollectionSubtype != PHAssetCollectionSubtypeSmartAlbumFavorites) {
-                continue;
+            if (smartResult) {
+                PHAssetCollectionSubtype subtype = collection.assetCollectionSubtype;
+                if (subtype != PHAssetCollectionSubtypeSmartAlbumUserLibrary &&
+                    subtype != PHAssetCollectionSubtypeSmartAlbumFavorites) {
+                    continue;
+                }
             }
             NSString *identifier = collection.localIdentifier;
             if (identifier.length == 0) {
                 return;  // An unidentifiable row is not proof of an empty library.
             }
-            // PhotoKit explicitly permits nil titles. One untitled album must
-            // not prevent every other album from appearing in Settings.
-            NSString *title = collection.localizedTitle;
-            if (title.length == 0) title = previousTitles[identifier] ?: @"未命名相簿";
-            if (![seen containsObject:identifier]) {
-                [seen addObject:identifier];
-                [inventory addObject:@{@"id": identifier, @"title": title}];
+            if ([seen containsObject:identifier]) {
+                continue;
             }
+            // Build the old-title index only when a title is actually missing.
+            // Fully titled or duplicate rows need no fallback lookup or scan.
+            NSString *title = collection.localizedTitle;
+            if (title.length == 0) {
+                if (previousTitles == nil) {
+                    previousTitles = [NSMutableDictionary dictionary];
+                    for (NSDictionary *album in previous) {
+                        previousTitles[album[@"id"]] = album[@"title"];
+                    }
+                }
+                title = previousTitles[identifier] ?: @"未命名相簿";
+            }
+            [seen addObject:identifier];
+            [inventory addObject:@{@"id": identifier, @"title": title}];
         }
     }
     // PhotoKit's fetch order is not the pane's ordering contract. Stable sorting

@@ -6,7 +6,7 @@
 #import <notify.h>
 #import <stdatomic.h>
 
-static NSUInteger gQueries, gTitleReads, gWrites, gSignals, gRegistrations, gCancellations;
+static NSUInteger gQueries, gTitleReads, gSubtypeReads, gWrites, gSignals, gRegistrations, gCancellations;
 static BOOL gSyncSucceeds = YES;
 static PHAuthorizationStatus gStatus = PHAuthorizationStatusAuthorized;
 static NSArray *gAlbumResult, *gSmartResult, *gStored;
@@ -37,6 +37,7 @@ static void Check(BOOL passed, const char *message) {
 @end
 @implementation HAInventoryTestCollection
 - (NSString *)localizedTitle { gTitleReads++; return _localizedTitle; }
+- (PHAssetCollectionSubtype)assetCollectionSubtype { gSubtypeReads++; return _assetCollectionSubtype; }
 + (NSArray *)fetchAssetCollectionsWithType:(PHAssetCollectionType)type
                                  subtype:(PHAssetCollectionSubtype)subtype options:(id)options {
     Check(![NSThread isMainThread], "queries stay off main");
@@ -214,7 +215,9 @@ static void RunTests(void) {
     HAAlbumInventoryWorker *worker = [HAAlbumInventoryWorker new];
     HAInventoryTestLibrary *library = [HAInventoryTestLibrary sharedPhotoLibrary];
     gAlbumResult = @[Album(@"B", @"Beta"), Album(@"A", @"Alpha")];
-    gSmartResult = @[Album(@"S", @"Smart"), Album(@"A", @"Alpha")];
+    HAInventoryTestCollection *userLibrary = Album(@"S", @"Smart");
+    userLibrary.assetCollectionSubtype = PHAssetCollectionSubtypeSmartAlbumUserLibrary;
+    gSmartResult = @[userLibrary, Album(@"A", @"Ignored duplicate")];
     Check(gQueries == 0, "constructor never opens library");
     for (NSUInteger status = PHAuthorizationStatusNotDetermined;
          status <= PHAuthorizationStatusLimited; status++) {
@@ -235,10 +238,15 @@ static void RunTests(void) {
     Refresh(worker);
     Check(gQueries == 2 && gRegistrations == 1 && gWrites == 1 && gSignals == 1,
           "startup queries ordinary and smart metadata independently of UI");
-    Check(gStored.count == 3 && [gStored[0][@"id"] isEqual:@"A"],
-          "metadata is deduplicated and stably sorted");
+    Check(gStored.count == 3 && [gStored[0][@"id"] isEqual:@"A"] &&
+          [gStored[0][@"title"] isEqual:@"Alpha"],
+          "metadata is deduplicated first-wins and stably sorted");
+    Check(gTitleReads == 3 && gSubtypeReads == 2,
+          "unique titles and smart subtypes are each read once");
     Refresh(worker);
     Check(gWrites == 1 && gRegistrations == 1, "unchanged lifecycle refresh never rewrites or reregisters");
+    Check(gTitleReads == 6 && gSubtypeReads == 4,
+          "repeated refresh still skips duplicate titles and repeated subtype reads");
     NSUInteger queries = gQueries, reads = gTitleReads;
     for (NSUInteger i = 0; i < 10000; i++) {
         [worker photoLibraryDidChange:[HAInventoryTestChange new]];
