@@ -528,6 +528,7 @@ static void HookedPresentViewController(id self, SEL _cmd, UIViewController *vie
 // that goes through unchanged, so the mute button keeps working.
 @interface PUBrowsingVideoPlayer : NSObject
 @property (nonatomic) BOOL isMuted;
+@property (nonatomic) float volume;
 @property (nonatomic) long long desiredPlayState;
 @property (readonly, nonatomic) long long playState;
 @end
@@ -538,18 +539,60 @@ static void (*OriginalSetMuted)(id, SEL, BOOL);
 // are the user's and are applied as they come.
 static BOOL gUserTouchedMute = NO;
 
+// The session's volume is what the mute button really moves; it is kept so the button can
+// drive it directly, through the same method Photos uses.
+@interface PXVideoSession : NSObject
+@property (readonly, nonatomic) float volume;
+- (void)setVolume:(float)volume withFade:(BOOL)fade;
+@end
+
+static void (*OriginalSessionSetVolume)(id, SEL, float, BOOL);
+static __weak PXVideoSession *gLastSession = nil;
+
+static void HookedSessionSetVolume(id self, SEL _cmd, float volume, BOOL fade) {
+    gLastSession = (PXVideoSession *)self;
+    OriginalSessionSetVolume(self, _cmd, volume, fade);
+}
+
 static void HookedSetMuted(id self, SEL _cmd, BOOL muted) {
+    PUBrowsingVideoPlayer *player = (PUBrowsingVideoPlayer *)self;
     // Photos mutes a video by itself while it starts (several times). Those requests are
-    // applied as "not muted" so the video starts with sound and Photos' own state agrees;
-    // once the user has pressed the mute button, everything is passed through untouched.
+    // applied as "not muted", and the audio is set to full so the video is really audible;
+    // once the user has pressed the mute button everything goes through.
     BOOL automatic = gAutoUnmuteVideo && muted && !gUserTouchedMute;
     OriginalSetMuted(self, _cmd, automatic ? NO : muted);
+    if (automatic) {
+        @try {
+            player.volume = 1.0f;
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        @try {
+            [gLastSession setVolume:1.0f withFade:NO];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+    }
 }
 
 static void (*OriginalPerformMuteAction)(id, SEL, BOOL);
 
+static BOOL gVideoMutedByUser = NO;
+
 static void HookedPerformMuteAction(id self, SEL _cmd, BOOL muted) {
     gUserTouchedMute = YES;
+    PXVideoSession *session = gLastSession;
+    if (gAutoUnmuteVideo && session != nil) {
+        // The sound is what the session volume carries here, so it is toggled directly;
+        // Photos' own button state has drifted from the audio and is left alone.
+        gVideoMutedByUser = !gVideoMutedByUser;
+        @try {
+            [session setVolume:(gVideoMutedByUser ? 0.0f : 1.0f) withFade:YES];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        return;
+    }
     OriginalPerformMuteAction(self, _cmd, muted);
 }
 
@@ -570,6 +613,11 @@ static void InstallVideoPlayerHooks(void) {
     }
     MSHookMessageEx(player, @selector(setMuted:),
                     (IMP)HookedSetMuted, (IMP *)&OriginalSetMuted);
+    Class session = objc_getClass("PXVideoSession");
+    if (session != Nil) {
+        MSHookMessageEx(session, @selector(setVolume:withFade:),
+                        (IMP)HookedSessionSetVolume, (IMP *)&OriginalSessionSetVolume);
+    }
     installed = YES;
 }
 
@@ -584,7 +632,7 @@ static void (*OriginalOneUpViewWillAppear)(id, SEL, BOOL);
 static void (*OriginalOneUpViewDidAppear)(id, SEL, BOOL);
 
 static void HookedOneUpViewWillAppear(id self, SEL _cmd, BOOL animated) {
-    gUserTouchedMute = NO;  // a video newly opened: its own start mutes are automatic
+    gUserTouchedMute = NO;   // a video newly opened: its start mutes are Photos' own
     InstallVideoPlayerHooks();
     OriginalOneUpViewWillAppear(self, _cmd, animated);
 }
