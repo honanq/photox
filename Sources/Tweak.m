@@ -7,7 +7,7 @@
 // sound, with its mute button still working. Every switch belongs to the
 // HiddenAlbumSettings pane and lives in the com.simon.hidden-album domain.
 //
-// Nine hooks, each on the class that implements the method:
+// Nine possible hook targets, enabled as needed on these concrete classes:
 //   -[PXPhotosViewModel _updateEmptyPlaceholderState]          the Hidden album
 //   -[PXGadgetUIViewController collectionView:numberOfItemsInSection:]      \
 //   -[PXGadgetUIViewController collectionView:layout:referenceSize...:]      / 人物与地点
@@ -26,79 +26,93 @@
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <substrate.h>
+#import <mach-o/dyld.h>
+#import <stdatomic.h>
 
 #import "ApelinBootstrap.h"
 
 #pragma mark - The settings
 
-// Read once per launch and re-read only when the pane says a value changed or
-// the app comes back to the front. Nothing polls.
+// Settings are snapshotted only at launch, on a change notification, or on
+// foreground entry. Layout callbacks never read preferences or invalidate an
+// unchanged snapshot.
 static BOOL gHideHiddenAlbum = YES;
 static BOOL gHidePeopleAndPlaces = YES;
 static BOOL gQuickDelete = NO;
 static BOOL gAutoUnmuteVideo = NO;
 static BOOL gLoaded = NO;
-static int gSettingsGeneration = 0;
+static BOOL gRestartScheduled = NO;
+static NSUInteger gSettingsGeneration = 0;
 static NSDictionary<NSString *, NSNumber *> *gHiddenAlbumFlags = nil;
+static void InstallConfiguredHooks(void);
+static dispatch_queue_t AlbumInventoryQueue(void);
 
 static NSUserDefaults *Preferences(void) {
-    return [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
+    static NSUserDefaults *defaults;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        defaults = [[NSUserDefaults alloc] initWithSuiteName:@APELIN_PACKAGE_ID];
+    });
+    return defaults;
 }
 
-static BOOL BoolFromPreferences(NSString *key, BOOL fallback) {
-    id value = [Preferences() objectForKey:key];
-    if (value != nil && [value respondsToSelector:@selector(boolValue)]) {
-        return [value boolValue];
-    }
-    return fallback;
+static BOOL BoolFromSnapshot(NSDictionary *snapshot, NSString *key, BOOL fallback) {
+    id value = snapshot[key];
+    return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : fallback;
 }
 
-// True when the pane has this album's own switch on. The pane stores one key
-// per album, "hide.<localIdentifier>".
 static BOOL AlbumIsHidden(PHAssetCollection *collection) {
-    if (![collection isKindOfClass:[PHAssetCollection class]] ||
-        collection.localIdentifier.length == 0) {
+    if (![collection isKindOfClass:[PHAssetCollection class]]) {
         return NO;
     }
-    if (gHiddenAlbumFlags == nil) {
-        NSDictionary *all = [Preferences() dictionaryRepresentation];
-        NSMutableDictionary *flags = [NSMutableDictionary dictionary];
-        for (NSString *key in all) {
-            if ([key hasPrefix:@"hide."]) {
-                flags[[key substringFromIndex:5]] = all[key];
-            }
-        }
-        gHiddenAlbumFlags = flags;
-    }
-    NSNumber *flag = gHiddenAlbumFlags[collection.localIdentifier];
-    return flag != nil && flag.boolValue;
+    NSString *identifier = collection.localIdentifier;
+    return identifier.length != 0 && gHiddenAlbumFlags[identifier].boolValue;
 }
 
 static void ReadSettings(void) {
-    BOOL album = BoolFromPreferences(@"enabled", YES);
-    BOOL peopleAndPlaces = BoolFromPreferences(@"hidePeoplePlaces", YES);
-    if (gLoaded && (album != gHideHiddenAlbum || peopleAndPlaces != gHidePeopleAndPlaces)) {
-        // A changed value ends this process: the next launch of Photos starts
-        // from it, with no data source carrying the old one.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            exit(0);
-        });
+    NSDictionary *snapshot = [Preferences() dictionaryRepresentation];
+    BOOL album = BoolFromSnapshot(snapshot, @"enabled", YES);
+    BOOL peopleAndPlaces = BoolFromSnapshot(snapshot, @"hidePeoplePlaces", YES);
+    BOOL restart = gLoaded &&
+        (album != gHideHiddenAlbum || peopleAndPlaces != gHidePeopleAndPlaces);
+
+    NSMutableDictionary<NSString *, NSNumber *> *flags = [NSMutableDictionary dictionary];
+    for (NSString *key in snapshot) {
+        if ([key hasPrefix:@"hide."] && key.length > 5 &&
+            BoolFromSnapshot(snapshot, key, NO)) {
+            flags[[key substringFromIndex:5]] = @YES;
+        }
+    }
+    if (gHiddenAlbumFlags == nil || ![gHiddenAlbumFlags isEqualToDictionary:flags]) {
+        gHiddenAlbumFlags = [flags copy];
+        gSettingsGeneration++;
     }
     gHideHiddenAlbum = album;
     gHidePeopleAndPlaces = peopleAndPlaces;
-    gQuickDelete = BoolFromPreferences(@"quickDelete", NO);
-    gAutoUnmuteVideo = BoolFromPreferences(@"autoUnmuteVideo", NO);
-    gHiddenAlbumFlags = nil;  // per-album switches are re-read on next use
-    gSettingsGeneration++;    // and every cached album list with them
+    gQuickDelete = BoolFromSnapshot(snapshot, @"quickDelete", NO);
+    gAutoUnmuteVideo = BoolFromSnapshot(snapshot, @"autoUnmuteVideo", NO);
     gLoaded = YES;
+    InstallConfiguredHooks();
+
+    if (restart && !gRestartScheduled) {
+        gRestartScheduled = YES;
+        // Drain previously queued inventory writes before leaving, without
+        // blocking Photos' main thread or scheduling a timer.
+        dispatch_async(AlbumInventoryQueue(), ^{
+            dispatch_async(dispatch_get_main_queue(), ^{ exit(0); });
+        });
+    }
 }
 
 static void SettingChangedCallback(CFNotificationCenterRef center, void *observer,
                                    CFStringRef name, const void *object,
                                    CFDictionaryRef userInfo) {
     (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
-    ReadSettings();
+    if ([NSThread isMainThread]) {
+        ReadSettings();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{ ReadSettings(); });
+    }
 }
 
 #pragma mark - The Hidden album
@@ -154,10 +168,8 @@ static void HARestoreFooter(PXPhotosViewModel *model,
 }
 
 static void (*OriginalUpdateEmptyPlaceholderState)(id, SEL);
-static void InstallVideoPlayerHooks(void);
 
 static void HookedUpdateEmptyPlaceholderState(id self, SEL _cmd) {
-    InstallVideoPlayerHooks();
     OriginalUpdateEmptyPlaceholderState(self, _cmd);
     if (![NSThread isMainThread]) {
         return;
@@ -236,27 +248,30 @@ static BOOL TitleIsPeopleAndPlaces(NSString *title) {
     return people && places;
 }
 
-// The verdict is kept on the gadget itself: the title is read once, while a section's item
-// count and header size can both ask for it on every layout pass. The gadget is fetched
-// through Photos' own index, never through the collection view, whose section count would
-// call back into this and recurse until the stack ran out.
-static BOOL GadgetIsPeopleAndPlaces(id gadget) {
-    @try {
-        NSNumber *cached = objc_getAssociatedObject(gadget, &kPeopleGadgetKey);
-        if (cached != nil) {
-            return cached.boolValue;
-        }
-        id value = [gadget valueForKey:@"title"];
-        if (![value isKindOfClass:[NSString class]] || [value length] == 0) {
-            value = [gadget valueForKey:@"localizedTitle"];
-        }
-        BOOL verdict = TitleIsPeopleAndPlaces([value isKindOfClass:[NSString class]] ? value : nil);
-        objc_setAssociatedObject(gadget, &kPeopleGadgetKey, @(verdict),
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return verdict;
-    } @catch (NSException *exception) {
+@protocol HATitledGadget <NSObject>
+- (NSString *)title;
+- (NSString *)localizedTitle;
+@end
+
+// Cache only a usable title; an initially untitled gadget can finish loading.
+// The getter checks also avoid throwing KVC exceptions on every layout pass.
+static BOOL GadgetIsPeopleAndPlaces(id<HATitledGadget> gadget) {
+    NSNumber *cached = objc_getAssociatedObject(gadget, &kPeopleGadgetKey);
+    if (cached != nil) {
+        return cached.boolValue;
+    }
+    id title = [gadget respondsToSelector:@selector(title)] ? [gadget title] : nil;
+    if ((![title isKindOfClass:[NSString class]] || [title length] == 0) &&
+        [gadget respondsToSelector:@selector(localizedTitle)]) {
+        title = [gadget localizedTitle];
+    }
+    if (![title isKindOfClass:[NSString class]] || [title length] == 0) {
         return NO;
     }
+    BOOL verdict = TitleIsPeopleAndPlaces(title);
+    objc_setAssociatedObject(gadget, &kPeopleGadgetKey, @(verdict),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return verdict;
 }
 
 static BOOL SectionIsPeopleAndPlaces(id controller, NSInteger section) {
@@ -302,10 +317,15 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
 - (PHAssetCollection *)collection;
 @end
 
-// The album cards Photos last handed out. The layout reads its positions from this array
-// instead of asking the provider again while a cell is laid out, and a new array is what
-// tells both the album list and the layout that something changed.
-static NSArray *gLastGadgets = nil;
+@interface HAAlbumProviderSnapshot : NSObject
+@property (nonatomic, weak) NSArray *gadgets;
+@property (nonatomic) NSUInteger count;
+@property (nonatomic, copy) NSArray<NSDictionary *> *inventory;
+@end
+@implementation HAAlbumProviderSnapshot
+@end
+
+static char kProviderSnapshotKey;
 
 static PHAssetCollection *CollectionOfGadget(id gadget) {
     PHAssetCollection *collection = nil;
@@ -319,14 +339,65 @@ static PHAssetCollection *CollectionOfGadget(id gadget) {
     return [collection isKindOfClass:[PHAssetCollection class]] ? collection : nil;
 }
 
-// The pane runs in Settings, which cannot read the photo library, so it is handed the album
-// list gathered from those cards. It is published only when the list itself changed.
-static void RecordAlbumsInGadgets(NSArray *gadgets) {
-    if (gadgets == gLastGadgets && gadgets != nil) {
-        return;  // the same array: nothing new to read or publish
+static dispatch_queue_t AlbumInventoryQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create(APELIN_PACKAGE_ID ".inventory", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+// Main-thread state describes the latest request, not a guaranteed disk commit.
+// A failed latest synchronization permits a retry on the next provider event.
+static NSArray<NSDictionary *> *gRequestedInventory;
+static NSUInteger gInventoryRequestGeneration;
+
+static NSArray<NSDictionary *> *QueueAlbumInventory(NSArray<NSDictionary *> *albums) {
+    if (albums == nil || gRestartScheduled) {
+        return albums;
     }
-    gLastGadgets = gadgets;
+    if (gRequestedInventory == albums || [gRequestedInventory isEqualToArray:albums]) {
+        return gRequestedInventory;
+    }
+    gRequestedInventory = [albums copy];
+    NSArray *inventory = gRequestedInventory;
+    NSUInteger generation = ++gInventoryRequestGeneration;
+    // Preserve the original last-provider-wins order without synchronizing
+    // cfprefsd on the UI thread. Equal provider snapshots share the same array.
+    dispatch_async(AlbumInventoryQueue(), ^{
+        CFPreferencesSetAppValue(CFSTR("albumInventory"),
+                                 (__bridge CFPropertyListRef)inventory,
+                                 (__bridge CFStringRef)@APELIN_PACKAGE_ID);
+        if (!CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID)) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (generation == gInventoryRequestGeneration) {
+                    gRequestedInventory = nil;
+                }
+            });
+        }
+    });
+    return inventory;
+}
+
+// Parse only a changed provider snapshot, but publish its cached inventory even
+// on a cache hit when a different provider most recently supplied the pane.
+static void RecordAlbumsInGadgets(id provider, NSArray *gadgets) {
+    HAAlbumProviderSnapshot *snapshot =
+        objc_getAssociatedObject(provider, &kProviderSnapshotKey);
+    if (snapshot != nil && snapshot.gadgets == gadgets && snapshot.count == gadgets.count) {
+        snapshot.inventory = QueueAlbumInventory(snapshot.inventory);
+        return;
+    }
+    if (snapshot == nil) {
+        snapshot = [HAAlbumProviderSnapshot new];
+        objc_setAssociatedObject(provider, &kProviderSnapshotKey, snapshot,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    snapshot.gadgets = gadgets;
+    snapshot.count = gadgets.count;
     if (gadgets.count == 0) {
+        snapshot.inventory = nil;  // Ignore a provider that has not loaded yet.
         return;
     }
     NSMutableArray<NSDictionary *> *albums = [NSMutableArray arrayWithCapacity:gadgets.count];
@@ -345,22 +416,16 @@ static void RecordAlbumsInGadgets(NSArray *gadgets) {
         [seen addObject:identifier];
         [albums addObject:@{@"id": identifier, @"title": title}];
     }
-    static NSArray<NSDictionary *> *published;
-    if (published != nil && [published isEqualToArray:albums]) {
-        return;
-    }
-    published = [albums copy];
-    CFPreferencesSetAppValue(CFSTR("albumInventory"),
-                             (__bridge CFPropertyListRef)published,
-                             (__bridge CFStringRef)@APELIN_PACKAGE_ID);
-    CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID);
+    snapshot.inventory = QueueAlbumInventory(albums);
 }
 
 static NSArray *(*OriginalGadgetProviderGadgets)(id, SEL);
 
 static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
     NSArray *gadgets = OriginalGadgetProviderGadgets(self, _cmd);
-    RecordAlbumsInGadgets(gadgets);
+    if ([NSThread isMainThread] && [gadgets isKindOfClass:[NSArray class]]) {
+        RecordAlbumsInGadgets(self, gadgets);
+    }
     return gadgets;
 }
 
@@ -371,72 +436,76 @@ static NSArray *HookedGadgetProviderGadgets(id self, SEL _cmd) {
 // i%2. Dropping a hidden album from the provider's array breaks Photos' own
 // indexing (it kept asking for index 10 of a 7 item array and crashed), so the
 // array is left alone and the layout is given the visible arrangement instead.
-static char kAlbumSlotMapKey;
-static char kAlbumListSourceKey;
-static char kAlbumListResolvedKey;
-static char kAlbumListProviderKey;
+@protocol HAAlbumGadgetProvider <NSObject>
+- (NSArray *)gadgets;
+@end
 
-// The album cards of the list this layout draws. The layout's data source is resolved once
-// and kept, and so is its provider, so a cell being laid out never walks KVC again.
-static NSArray *AlbumCardsForLayout(id layout) {
-    NSNumber *resolved = objc_getAssociatedObject(layout, &kAlbumListResolvedKey);
-    if (resolved == nil) {
-        id candidate = nil;
-        @try {
-            candidate = [[layout valueForKey:@"collectionView"] dataSource];
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
+@interface PUHorizontalAlbumListGadget : NSObject
+- (id<HAAlbumGadgetProvider>)provider;
+@end
+
+@interface HAAlbumLayoutState : NSObject
+@property (nonatomic, weak) id dataSource;
+@property (nonatomic) BOOL matchesAlbumList;
+@property (nonatomic, weak) id<HAAlbumGadgetProvider> provider;
+@property (nonatomic, weak) NSArray *gadgets;
+@property (nonatomic) NSUInteger settingsGeneration;
+@property (nonatomic) NSUInteger count;
+@property (nonatomic, copy) NSArray<NSNumber *> *hidden;
+@property (nonatomic, copy) NSArray<NSNumber *> *slots;
+@property (nonatomic) BOOL metricsValid;
+@property (nonatomic) CGSize boundsSize;
+@property (nonatomic) CGSize cardSize;
+@property (nonatomic) CGPoint origin;
+@property (nonatomic) CGFloat columnStep;
+@property (nonatomic) CGFloat rowOffset;
+@end
+@implementation HAAlbumLayoutState
+@end
+
+static char kAlbumLayoutStateKey;
+static UICollectionViewLayoutAttributes *(*OriginalAlbumLayoutItem)(id, SEL, NSIndexPath *);
+
+// The concrete layout inherits collectionView from UICollectionViewLayout.
+// Resolve only its own list; weak references avoid layout -> controller cycles.
+static HAAlbumLayoutState *AlbumSlotMap(UICollectionViewLayout *layout) {
+    id dataSource = layout.collectionView.dataSource;
+    if (dataSource == nil) {
+        return nil;  // A layout can be queried before its view has a data source.
+    }
+    HAAlbumLayoutState *state = objc_getAssociatedObject(layout, &kAlbumLayoutStateKey);
+    if (state == nil) {
+        state = [HAAlbumLayoutState new];
+        objc_setAssociatedObject(layout, &kAlbumLayoutStateKey, state,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (state.dataSource != dataSource) {
+        state.dataSource = dataSource;
+        state.provider = nil;
+        state.gadgets = nil;
+        state.hidden = nil;
+        state.metricsValid = NO;
         Class albumListClass = objc_getClass("PUHorizontalAlbumListGadget");
-        BOOL matches = candidate != nil && albumListClass != Nil &&
-                       [candidate isKindOfClass:albumListClass];
-        objc_setAssociatedObject(layout, &kAlbumListResolvedKey, @(matches),
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (!matches) {
-            return nil;  // another layout of the Albums tab
-        }
-        objc_setAssociatedObject(layout, &kAlbumListSourceKey, candidate,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } else if (!resolved.boolValue) {
+        state.matchesAlbumList = albumListClass != Nil &&
+            [dataSource isKindOfClass:albumListClass] &&
+            [dataSource respondsToSelector:@selector(provider)];
+    }
+    if (!state.matchesAlbumList) {
         return nil;
     }
-
-    id dataSource = objc_getAssociatedObject(layout, &kAlbumListSourceKey);
-    id provider = objc_getAssociatedObject(dataSource, &kAlbumListProviderKey);
-    if (provider == nil) {
-        @try {
-            provider = [dataSource valueForKey:@"provider"];
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
-        if (provider == nil || ![provider respondsToSelector:@selector(gadgets)]) {
-            return nil;
-        }
-        objc_setAssociatedObject(dataSource, &kAlbumListProviderKey, provider,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    NSArray *gadgets = nil;
-    @try {
-        gadgets = [(id)provider performSelector:@selector(gadgets)];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
-    return [gadgets isKindOfClass:[NSArray class]] ? gadgets : nil;
-}
-
-// One pass over this list's albums, kept on the layout: `hidden` says which albums the pane
-// hides, `slots` which visible position each one takes. It is rebuilt only when a switch
-// changed, or when the list's length did, so laying out a cell costs two array lookups.
-static NSDictionary *AlbumSlotMap(id layout) {
-    NSArray *gadgets = AlbumCardsForLayout(layout);
-    if (gadgets == nil) {
+    id<HAAlbumGadgetProvider> provider = [(PUHorizontalAlbumListGadget *)dataSource provider];
+    if (provider == nil || ![provider respondsToSelector:@selector(gadgets)]) {
         return nil;
     }
-    NSDictionary *cached = objc_getAssociatedObject(layout, &kAlbumSlotMapKey);
-    if (cached != nil &&
-        [cached[@"settings"] intValue] == gSettingsGeneration &&
-        [cached[@"count"] unsignedIntegerValue] == gadgets.count) {
-        return cached;
+    NSArray *gadgets = [provider gadgets];
+    if (![gadgets isKindOfClass:[NSArray class]]) {
+        return nil;
+    }
+    // The native provider's gadgets property is copy/NSArray on this device.
+    // A replacement snapshot invalidates even when its item count is unchanged.
+    if (state.hidden != nil && state.provider == provider && state.gadgets == gadgets &&
+        state.count == gadgets.count && state.settingsGeneration == gSettingsGeneration) {
+        return state;
     }
 
     NSUInteger count = gadgets.count;
@@ -444,87 +513,83 @@ static NSDictionary *AlbumSlotMap(id layout) {
     NSMutableArray<NSNumber *> *slots = [NSMutableArray arrayWithCapacity:count];
     NSUInteger visible = 0;
     for (id gadget in gadgets) {
-        PHAssetCollection *collection = CollectionOfGadget(gadget);
-        BOOL isHidden = collection != nil && AlbumIsHidden(collection);
+        BOOL isHidden = AlbumIsHidden(CollectionOfGadget(gadget));
         [hidden addObject:@(isHidden)];
         [slots addObject:@(visible)];
         if (!isHidden) {
             visible++;
         }
     }
-    NSDictionary *map = @{@"settings": @(gSettingsGeneration),
-                          @"count": @(count),
-                          @"hidden": hidden,
-                          @"slots": slots};
-    objc_setAssociatedObject(layout, &kAlbumSlotMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return map;
+    state.provider = provider;
+    state.gadgets = gadgets;
+    state.count = count;
+    state.settingsGeneration = gSettingsGeneration;
+    state.hidden = hidden;
+    state.slots = slots;
+    state.metricsValid = NO;
+    return state;
 }
 
-static char kAlbumLayoutMetricsKey;
-
-static UICollectionViewLayoutAttributes *(*OriginalAlbumLayoutItem)(id, SEL, NSIndexPath *);
-
-// Column step and row offset, read from the layout's own attributes once and kept
-// on the layout instance.
-static BOOL AlbumLayoutMetrics(id layout, SEL _cmd, CGFloat *columnStep, CGFloat *rowOffset) {
-    NSArray *cached = objc_getAssociatedObject(layout, &kAlbumLayoutMetricsKey);
-    if ([cached isKindOfClass:[NSArray class]] && cached.count == 2) {
-        *columnStep = [cached[0] doubleValue];
-        *rowOffset = [cached[1] doubleValue];
-        return *columnStep > 0 && *rowOffset > 0;
+static BOOL AlbumLayoutMetrics(UICollectionViewLayout *layout, SEL selector,
+                               HAAlbumLayoutState *state, CGSize cardSize) {
+    CGSize boundsSize = layout.collectionView.bounds.size;
+    if (state.metricsValid && CGSizeEqualToSize(state.boundsSize, boundsSize) &&
+        CGSizeEqualToSize(state.cardSize, cardSize)) {
+        return YES;
+    }
+    if (state.count < 2) {
+        return NO;
     }
     UICollectionViewLayoutAttributes *first =
-        OriginalAlbumLayoutItem(layout, _cmd, [NSIndexPath indexPathForItem:0 inSection:0]);
+        OriginalAlbumLayoutItem(layout, selector, [NSIndexPath indexPathForItem:0 inSection:0]);
     UICollectionViewLayoutAttributes *second =
-        OriginalAlbumLayoutItem(layout, _cmd, [NSIndexPath indexPathForItem:1 inSection:0]);
-    UICollectionViewLayoutAttributes *third =
-        OriginalAlbumLayoutItem(layout, _cmd, [NSIndexPath indexPathForItem:2 inSection:0]);
-    if (first == nil || second == nil || third == nil) {
+        OriginalAlbumLayoutItem(layout, selector, [NSIndexPath indexPathForItem:1 inSection:0]);
+    UICollectionViewLayoutAttributes *third = state.count >= 3 ?
+        OriginalAlbumLayoutItem(layout, selector, [NSIndexPath indexPathForItem:2 inSection:0]) : nil;
+    if (first == nil || second == nil || (state.count >= 3 && third == nil)) {
         return NO;
     }
-    *columnStep = third.frame.origin.x - first.frame.origin.x;
-    *rowOffset = second.frame.origin.y - first.frame.origin.y;
-    if (*columnStep <= 0 || *rowOffset <= 0) {
+    CGFloat columnStep = third != nil ? third.frame.origin.x - first.frame.origin.x : 1;
+    CGFloat rowOffset = second.frame.origin.y - first.frame.origin.y;
+    if (columnStep <= 0 || rowOffset <= 0) {
         return NO;
     }
-    objc_setAssociatedObject(layout, &kAlbumLayoutMetricsKey,
-                             @[@(*columnStep), @(*rowOffset)],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    state.origin = first.frame.origin;
+    state.columnStep = columnStep;
+    state.rowOffset = rowOffset;
+    state.boundsSize = boundsSize;
+    state.cardSize = cardSize;
+    state.metricsValid = YES;
     return YES;
 }
 
 static UICollectionViewLayoutAttributes *HookedAlbumLayoutItem(id self, SEL _cmd,
                                                                NSIndexPath *indexPath) {
     UICollectionViewLayoutAttributes *attributes = OriginalAlbumLayoutItem(self, _cmd, indexPath);
-    if (indexPath.section != 0 || indexPath.item < 0) {
+    if (attributes == nil || gHiddenAlbumFlags.count == 0 ||
+        indexPath.section != 0 || indexPath.item < 0) {
         return attributes;
     }
-    // AlbumSlotMap resolves the layout's own list once; nil means this layout draws another
-    // part of the Albums tab, and the attributes are left as Photos made them.
-    NSDictionary *map = AlbumSlotMap(self);
-    NSArray<NSNumber *> *hidden = map[@"hidden"];
-    NSArray<NSNumber *> *slots = map[@"slots"];
-    if ((NSUInteger)indexPath.item >= hidden.count) {
+    HAAlbumLayoutState *state = AlbumSlotMap(self);
+    NSUInteger item = (NSUInteger)indexPath.item;
+    if (state == nil || item >= state.count) {
         return attributes;
     }
-    if (hidden[indexPath.item].boolValue) {
-        attributes.hidden = YES;
+    if (state.hidden[item].boolValue) {
+        UICollectionViewLayoutAttributes *result = [attributes copy];
+        result.hidden = YES;
+        return result;
+    }
+    NSUInteger slot = state.slots[item].unsignedIntegerValue;
+    if (slot == item || !AlbumLayoutMetrics(self, _cmd, state, attributes.size)) {
         return attributes;
     }
-    NSUInteger slot = slots[indexPath.item].unsignedIntegerValue;
-    if (slot == (NSUInteger)indexPath.item) {
-        return attributes;  // nothing hidden before this card
-    }
-    CGFloat columnStep = 0;
-    CGFloat rowOffset = 0;
-    if (!AlbumLayoutMetrics(self, _cmd, &columnStep, &rowOffset)) {
-        return attributes;
-    }
-    CGRect frame = attributes.frame;
-    frame.origin.x = (CGFloat)(slot / 2) * columnStep;
-    frame.origin.y = (CGFloat)(slot % 2) * rowOffset;
-    attributes.frame = frame;
-    return attributes;
+    UICollectionViewLayoutAttributes *result = [attributes copy];
+    CGRect frame = result.frame;
+    frame.origin.x = state.origin.x + (CGFloat)(slot / 2) * state.columnStep;
+    frame.origin.y = state.origin.y + (CGFloat)(slot % 2) * state.rowOffset;
+    result.frame = frame;
+    return result;
 }
 
 #pragma mark - Deleting a photo without the question
@@ -533,7 +598,7 @@ static UICollectionViewLayoutAttributes *HookedAlbumLayoutItem(id self, SEL _cmd
 // choosing 删除 brings a second confirmation. With the switch on neither is
 // presented: the 删除 action of the one that Photos asks for is run instead, so
 // the photo is deleted straight away and still lands in 最近删除.
-static BOOL (*OriginalPresentViewController)(id, SEL, UIViewController *, BOOL, void (^)(void));
+static void (*OriginalPresentViewController)(id, SEL, UIViewController *, BOOL, void (^)(void));
 
 static BOOL TitleMentionsAlbum(NSString *title) {
     return [title containsString:@"相簿"] ||
@@ -699,97 +764,130 @@ static void HookedPerformMuteAction(id self, SEL _cmd, BOOL muted) {
     }];
 }
 
-static void InstallVideoPlayerHooks(void) {
-    static BOOL installed = NO;
-    if (installed) {
-        return;
-    }
-    Class player = objc_getClass("PUBrowsingVideoPlayer");
-    if (player == Nil) {
-        return;  // not loaded yet; a later call tries again
-    }
-    MSHookMessageEx(player, @selector(setMuted:),
-                    (IMP)HookedSetMuted, (IMP *)&OriginalSetMuted);
-    Class session = objc_getClass("PXVideoSession");
-    if (session != Nil) {
-        MSHookMessageEx(session, @selector(setVolume:withFade:),
-                        (IMP)HookedSessionSetVolume, (IMP *)&OriginalSessionSetVolume);
-    }
-    installed = YES;
-}
+#pragma mark - Hook installation
 
-#pragma mark - Hooks
+static atomic_bool gWaitingForHookClasses;
+static atomic_bool gHookInstallQueued;
 
 static void HookSelector(Class cls, SEL selector, IMP hook, IMP *original) {
-    if (cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
+    if (*original == NULL && cls != Nil && class_getInstanceMethod(cls, selector) != NULL) {
         MSHookMessageEx(cls, selector, hook, original);
     }
 }
 
+static void HookNamedClass(const char *name, SEL selector, IMP hook, IMP *original,
+                           BOOL requireOwnImplementation, BOOL *waiting) {
+    if (*original != NULL) {
+        return;
+    }
+    Class cls = objc_getClass(name);
+    if (cls == Nil) {
+        *waiting = YES;
+        return;
+    }
+    if (requireOwnImplementation) {
+        Method method = class_getInstanceMethod(cls, selector);
+        Class parent = class_getSuperclass(cls);
+        if (method == NULL || method == class_getInstanceMethod(parent, selector)) {
+            return;  // Never fall back to hooking a base layout implementation.
+        }
+    }
+    HookSelector(cls, selector, hook, original);
+}
+
+// Only enabled features install hooks. Once installed, a hook stays chained;
+// changing its setting makes it pass through until the next app launch.
+static void InstallConfiguredHooks(void) {
+    // Arm the image callback before looking for classes, including when a new
+    // setting enables a previously unused feature during a concurrent load.
+    atomic_store_explicit(&gWaitingForHookClasses, true, memory_order_relaxed);
+    BOOL waiting = NO;
+    if (gHideHiddenAlbum && OriginalUpdateEmptyPlaceholderState == NULL) {
+        Class model = objc_getClass("PXPhotosViewModel");
+        Class privacy = objc_getClass("PXContentPrivacyController");
+        if (model == Nil || privacy == Nil) {
+            waiting = YES;
+        } else {
+            BOOL supported = YES;
+            SEL selectors[] = {
+                @selector(_updateEmptyPlaceholderState), @selector(privacyController),
+                @selector(emptyPlaceholderState), @selector(setEmptyPlaceholderState:),
+                @selector(footerVisibilityStyle), @selector(setFooterVisibilityStyle:),
+                @selector(wantsFooterVisible), @selector(setWantsFooterVisible:)
+            };
+            for (NSUInteger i = 0; supported && i < sizeof(selectors) / sizeof(selectors[0]); i++) {
+                supported = [model instancesRespondToSelector:selectors[i]];
+            }
+            if (supported &&
+                [privacy instancesRespondToSelector:@selector(assetCollectionToObserve)] &&
+                [privacy instancesRespondToSelector:@selector(isLocked)]) {
+                HookSelector(model, @selector(_updateEmptyPlaceholderState),
+                             (IMP)HookedUpdateEmptyPlaceholderState,
+                             (IMP *)&OriginalUpdateEmptyPlaceholderState);
+            }
+        }
+    }
+    if (gHidePeopleAndPlaces) {
+        HookNamedClass("PXGadgetUIViewController", @selector(collectionView:numberOfItemsInSection:),
+                       (IMP)HookedGadgetNumberOfItems, (IMP *)&OriginalGadgetNumberOfItems, NO, &waiting);
+        HookNamedClass("PXGadgetUIViewController",
+                       @selector(collectionView:layout:referenceSizeForHeaderInSection:),
+                       (IMP)HookedHeaderSize, (IMP *)&OriginalHeaderSize, NO, &waiting);
+    }
+    // Inventory is needed by the settings pane even when no cards are hidden.
+    HookNamedClass("PUAlbumsGadgetProvider", @selector(gadgets),
+                   (IMP)HookedGadgetProviderGadgets, (IMP *)&OriginalGadgetProviderGadgets, NO, &waiting);
+    if (gHiddenAlbumFlags.count != 0) {
+        HookNamedClass("PUDoubleHeightHorizontalAlbumListGadgetLayout",
+                       @selector(layoutAttributesForItemAtIndexPath:),
+                       (IMP)HookedAlbumLayoutItem, (IMP *)&OriginalAlbumLayoutItem, YES, &waiting);
+    }
+    if (gQuickDelete) {
+        HookNamedClass("PUOneUpViewController", @selector(presentViewController:animated:completion:),
+                       (IMP)HookedPresentViewController, (IMP *)&OriginalPresentViewController, NO, &waiting);
+    }
+    if (gAutoUnmuteVideo) {
+        HookNamedClass("PUOneUpBarsController", @selector(_performMuteAction:),
+                       (IMP)HookedPerformMuteAction, (IMP *)&OriginalPerformMuteAction, NO, &waiting);
+        HookNamedClass("PUBrowsingVideoPlayer", @selector(setMuted:),
+                       (IMP)HookedSetMuted, (IMP *)&OriginalSetMuted, NO, &waiting);
+        HookNamedClass("PXVideoSession", @selector(setVolume:withFade:),
+                       (IMP)HookedSessionSetVolume, (IMP *)&OriginalSessionSetVolume, NO, &waiting);
+    }
+    atomic_store_explicit(&gWaitingForHookClasses, waiting, memory_order_relaxed);
+}
+
+// dyld only queues one main-thread attempt when an image is actually added.
+// No timer, hot-path availability check, or work under dyld's loader lock.
+static void HAImageAdded(const struct mach_header *header, intptr_t slide) {
+    (void)header; (void)slide;
+    if (!atomic_load_explicit(&gWaitingForHookClasses, memory_order_relaxed) ||
+        atomic_exchange_explicit(&gHookInstallQueued, true, memory_order_relaxed)) {
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        atomic_store_explicit(&gHookInstallQueued, false, memory_order_relaxed);
+        InstallConfiguredHooks();
+    });
+}
+
 __attribute__((constructor)) static void TweakInitialize(void) {
-    // Apelin's confirm_loaded reads this marker; it is the only line logged.
+    // Required by Apelin; no feature, debugging, or periodic logging is kept.
     os_log(os_log_create(APELIN_PACKAGE_ID, "tweak"), "ApelinLoaded %{public}s in %{public}s",
            APELIN_BUILD_ID, getprogname());
 
     ReadSettings();
+    _dyld_register_func_for_add_image(HAImageAdded);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     SettingChangedCallback,
                                     (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/changed"),
-                                    NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
                     object:nil
-                     queue:nil
+                     queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
         (void)note;
         ReadSettings();
-        InstallVideoPlayerHooks();
     }];
-
-    // These private interfaces are checked once, outside the update path. An
-    // unfamiliar Photos version keeps its original protected presentation.
-    Class photosViewModel = objc_getClass("PXPhotosViewModel");
-    Class privacyController = objc_getClass("PXContentPrivacyController");
-    BOOL supportsHiddenPresentation = photosViewModel != Nil && privacyController != Nil;
-    SEL modelSelectors[] = {
-        @selector(_updateEmptyPlaceholderState), @selector(privacyController),
-        @selector(emptyPlaceholderState), @selector(setEmptyPlaceholderState:),
-        @selector(footerVisibilityStyle), @selector(setFooterVisibilityStyle:),
-        @selector(wantsFooterVisible), @selector(setWantsFooterVisible:)
-    };
-    for (NSUInteger i = 0; supportsHiddenPresentation &&
-         i < sizeof(modelSelectors) / sizeof(modelSelectors[0]); i++) {
-        supportsHiddenPresentation =
-            [photosViewModel instancesRespondToSelector:modelSelectors[i]];
-    }
-    if (supportsHiddenPresentation &&
-        [privacyController instancesRespondToSelector:@selector(assetCollectionToObserve)] &&
-        [privacyController instancesRespondToSelector:@selector(isLocked)]) {
-        HookSelector(photosViewModel, @selector(_updateEmptyPlaceholderState),
-                     (IMP)HookedUpdateEmptyPlaceholderState,
-                     (IMP *)&OriginalUpdateEmptyPlaceholderState);
-    }
-
-    Class gadgetController = objc_getClass("PXGadgetUIViewController");
-    HookSelector(gadgetController, @selector(collectionView:numberOfItemsInSection:),
-                 (IMP)HookedGadgetNumberOfItems, (IMP *)&OriginalGadgetNumberOfItems);
-    HookSelector(gadgetController, @selector(collectionView:layout:referenceSizeForHeaderInSection:),
-                 (IMP)HookedHeaderSize, (IMP *)&OriginalHeaderSize);
-
-    HookSelector(objc_getClass("PUAlbumsGadgetProvider"), @selector(gadgets),
-                 (IMP)HookedGadgetProviderGadgets, (IMP *)&OriginalGadgetProviderGadgets);
-
-    HookSelector(objc_getClass("PUDoubleHeightHorizontalAlbumListGadgetLayout"),
-                 @selector(layoutAttributesForItemAtIndexPath:),
-                 (IMP)HookedAlbumLayoutItem, (IMP *)&OriginalAlbumLayoutItem);
-
-    HookSelector(objc_getClass("PUOneUpViewController"),
-                 @selector(presentViewController:animated:completion:),
-                 (IMP)HookedPresentViewController, (IMP *)&OriginalPresentViewController);
-
-    HookSelector(objc_getClass("PUOneUpBarsController"), @selector(_performMuteAction:),
-                 (IMP)HookedPerformMuteAction, (IMP *)&OriginalPerformMuteAction);
-
-    InstallVideoPlayerHooks();
 }
