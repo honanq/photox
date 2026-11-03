@@ -577,17 +577,17 @@ static void HookedSetMuted(id self, SEL _cmd, BOOL muted) {
 
 static void (*OriginalPerformMuteAction)(id, SEL, BOOL);
 
-static BOOL gVideoMutedByUser = NO;
 
 static void HookedPerformMuteAction(id self, SEL _cmd, BOOL muted) {
     gUserTouchedMute = YES;
     PXVideoSession *session = gLastSession;
     if (gAutoUnmuteVideo && session != nil) {
-        // The sound is what the session volume carries here, so it is toggled directly;
-        // Photos' own button state has drifted from the audio and is left alone.
-        gVideoMutedByUser = !gVideoMutedByUser;
+        // The audible level here is the session volume, so it is toggled directly; Photos'
+        // own mute state has drifted from the audio and is left alone.
+        static BOOL userMuted = NO;
+        userMuted = !userMuted;
         @try {
-            [session setVolume:(gVideoMutedByUser ? 0.0f : 1.0f) withFade:YES];
+            [session setVolume:(userMuted ? 0.0f : 1.0f) withFade:YES];
         } @catch (NSException *exception) {
             (void)exception;
         }
