@@ -6,6 +6,7 @@
 // as "hide.<localIdentifier>", which is what the tweak reads to leave that album
 // out of the Albums page.
 #import <Preferences/PSListController.h>
+#import <notify.h>
 
 // Treat malformed/stale values as an empty inventory. Keep the first valid
 // record for an identifier, and own immutable strings for the cached snapshot.
@@ -38,6 +39,8 @@ static NSArray<NSDictionary *> *HAValidatedAlbumInventory(id value) {
 @property (nonatomic, strong) NSUserDefaults *ha_inventoryDefaults;
 @property (nonatomic, copy) NSArray<NSDictionary *> *ha_albumInventory;
 @property (nonatomic) BOOL ha_pageVisible;
+@property (nonatomic) int ha_inventoryNotifyToken;
+@property (nonatomic) BOOL ha_inventoryNotifyRegistered;
 @end
 
 @implementation HiddenAlbumAlbumsController
@@ -109,6 +112,22 @@ static NSArray<NSDictionary *> *HAValidatedAlbumInventory(id value) {
     [center removeObserver:self name:UIApplicationDidBecomeActiveNotification object:nil];
     [center addObserver:self selector:@selector(ha_applicationDidBecomeActive:)
                   name:UIApplicationDidBecomeActiveNotification object:nil];
+    if (!self.ha_inventoryNotifyRegistered) {
+        __weak HiddenAlbumAlbumsController *weakSelf = self;
+        int token = 0;
+        uint32_t status = notify_register_dispatch(APELIN_PACKAGE_ID "/inventoryChanged",
+            &token, dispatch_get_main_queue(), ^(int notificationToken) {
+                (void)notificationToken;
+                HiddenAlbumAlbumsController *controller = weakSelf;
+                if (controller.ha_pageVisible) {
+                    [controller ha_refreshAlbumInventory];
+                }
+            });
+        if (status == NOTIFY_STATUS_OK) {
+            self.ha_inventoryNotifyToken = token;
+            self.ha_inventoryNotifyRegistered = YES;
+        }
+    }
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -130,6 +149,9 @@ static NSArray<NSDictionary *> *HAValidatedAlbumInventory(id value) {
 }
 
 - (void)dealloc {
+    if (_ha_inventoryNotifyRegistered) {
+        notify_cancel(_ha_inventoryNotifyToken);
+    }
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 

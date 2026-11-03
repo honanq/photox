@@ -21,6 +21,8 @@
 static Class HATestGetClass(const char *name);
 static void HATestSetPreference(CFStringRef key, CFPropertyListRef value, CFStringRef domain);
 static Boolean HATestSynchronize(CFStringRef domain);
+static void HATestInventoryNotification(CFNotificationCenterRef center, CFNotificationName name,
+                                       const void *object, CFDictionaryRef info, Boolean deliver);
 
 // All system headers are imported first. Suppress only the source constructor;
 // the test includes the actual production functions, not copies of their logic.
@@ -30,6 +32,7 @@ static Boolean HATestSynchronize(CFStringRef domain);
 #define objc_getClass HATestGetClass
 #define CFPreferencesSetAppValue HATestSetPreference
 #define CFPreferencesAppSynchronize HATestSynchronize
+#define CFNotificationCenterPostNotification HATestInventoryNotification
 #define APELIN_PACKAGE_ID "local.apelin.synthetic-cache-tests"
 #define APELIN_BUILD_ID "synthetic-test"
 #import "../Sources/Tweak.m"
@@ -39,6 +42,7 @@ static Boolean HATestSynchronize(CFStringRef domain);
 #undef objc_getClass
 #undef CFPreferencesSetAppValue
 #undef CFPreferencesAppSynchronize
+#undef CFNotificationCenterPostNotification
 
 static NSUInteger gAssertions;
 static NSUInteger gFailures;
@@ -47,6 +51,14 @@ static NSUInteger gHookCalls;
 static NSUInteger gWrites;              // Accessed on inventory queue only.
 static BOOL gSynchronizationSucceeds = YES;
 static NSArray *gSavedInventory;
+static NSUInteger gInventoryNotifications;
+
+static void HATestInventoryNotification(CFNotificationCenterRef center, CFNotificationName name,
+                                       const void *object, CFDictionaryRef info, Boolean deliver) {
+    (void)center; (void)object; (void)info; (void)deliver;
+    NSCAssert(CFEqual(name, CFSTR(APELIN_PACKAGE_ID "/inventoryChanged")), @"Unexpected signal");
+    gInventoryNotifications++;
+}
 
 static void CHECK(BOOL condition, const char *label) {
     gAssertions++;
@@ -259,6 +271,103 @@ static void TestTitles(void) {
     CHECK(TitleIsPeopleAndPlaces(@"People & Places"), "English title supported");
 }
 
+@interface HATestPrivacy : NSObject
+@property (nonatomic, getter=isLocked) BOOL locked;
+@property (nonatomic, strong) id assetCollectionToObserve;
+@end
+@implementation HATestPrivacy
+@end
+
+@interface HATestAssetSource : NSObject
+@property (nonatomic, strong) id containerCollection;
+@property (nonatomic) NSUInteger collectionReads;
+@end
+@implementation HATestAssetSource
+- (id)containerCollection { _collectionReads++; return _containerCollection; }
+@end
+
+@interface HATestPhotosModel : NSObject
+@property (nonatomic, strong) HATestPrivacy *privacyController;
+@property (nonatomic, strong) HATestAssetSource *currentDataSource;
+@property (nonatomic) NSInteger contentPrivacyState;
+@property (nonatomic) NSInteger emptyPlaceholderState;
+@property (nonatomic) NSInteger footerVisibilityStyle;
+@property (nonatomic) BOOL wantsFooterVisible;
+@end
+@implementation HATestPhotosModel
+@end
+
+static void TestOriginalEmptySetter(id object, SEL selector, NSInteger value) {
+    (void)selector;
+    [(HATestPhotosModel *)object setEmptyPlaceholderState:value];
+}
+static void SetPresentation(HATestPhotosModel *model, NSInteger value) {
+    HookedSetEmptyPlaceholderState(model, @selector(setEmptyPlaceholderState:), value);
+}
+static void TestHiddenPresentation(void) {
+    OriginalSetEmptyPlaceholderState = TestOriginalEmptySetter;
+    gHideHiddenAlbum = YES;
+    HATestCollection *hidden = Gadget(@"SYNTHETIC-HIDDEN").testCollection;
+    hidden.assetCollectionType = PHAssetCollectionTypeSmartAlbum;
+    hidden.assetCollectionSubtype = PHAssetCollectionSubtypeSmartAlbumAllHidden;
+    HATestPhotosModel *model = [HATestPhotosModel new];
+    model.footerVisibilityStyle = 2;
+    model.wantsFooterVisible = YES;
+    SetPresentation(model, 0);
+    CHECK(model.emptyPlaceholderState == 0 && model.footerVisibilityStyle == 2,
+          "absent privacy controller leaves native presentation untouched");
+    HATestPrivacy *privacy = [HATestPrivacy new];
+    model.privacyController = privacy;
+    privacy.assetCollectionToObserve = hidden;
+    privacy.locked = YES;
+    model.contentPrivacyState = 1;
+    SetPresentation(model, 1);
+    CHECK(model.emptyPlaceholderState == 1 && model.footerVisibilityStyle == 2,
+          "native locked presentation preserved");
+    privacy.locked = NO;
+    SetPresentation(model, 0);
+    CHECK(model.emptyPlaceholderState == 0, "stale locked view-model state never overridden");
+    model.contentPrivacyState = 0;
+    SetPresentation(model, 1);
+    CHECK(model.emptyPlaceholderState == 1, "explicit native locked request always wins");
+    SetPresentation(model, 0);
+    CHECK(model.emptyPlaceholderState == 3 && model.footerVisibilityStyle == 0 &&
+          !model.wantsFooterVisible, "unlocked synthetic Hidden presents native empty without footer");
+    SetPresentation(model, 0);
+    CHECK(model.emptyPlaceholderState == 3, "later native content publication stays empty");
+    privacy.locked = YES;
+    model.contentPrivacyState = 1;
+    SetPresentation(model, 1);
+    CHECK(model.emptyPlaceholderState == 1 && model.footerVisibilityStyle == 2,
+          "relocking restores native protection and footer policy");
+    privacy.locked = NO;
+    model.contentPrivacyState = 0;
+    privacy.assetCollectionToObserve = nil;
+    HATestAssetSource *source = [HATestAssetSource new];
+    source.containerCollection = hidden;
+    model.currentDataSource = source;
+    SetPresentation(model, 0);
+    CHECK(model.emptyPlaceholderState == 3 && source.collectionReads == 1,
+          "missing observed collection resolves this model's display source");
+    for (NSUInteger i = 0; i < 10000; i++) SetPresentation(model, 0);
+    CHECK(source.collectionReads == 1, "10000 presentation hits never rescan source identity");
+    HATestAssetSource *other = [HATestAssetSource new];
+    other.containerCollection = Gadget(@"SYNTHETIC-ORDINARY").testCollection;
+    model.currentDataSource = other;
+    SetPresentation(model, 0);
+    CHECK(model.emptyPlaceholderState == 0 && model.footerVisibilityStyle == 2,
+          "source replacement invalidates Hidden identity and restores footer");
+    model.currentDataSource = source;
+    SetPresentation(model, 0);
+    gHideHiddenAlbum = NO;
+    SetPresentation(model, 0);
+    CHECK(model.emptyPlaceholderState == 0 && model.footerVisibilityStyle == 2,
+          "disabled feature passes through and restores footer");
+    CHECK(!privacy.locked && model.currentDataSource == source && source.containerCollection == hidden,
+          "synthetic privacy flag and real-source reference never mutated");
+    gHideHiddenAlbum = YES;
+}
+
 static void TestInventory(void) {
     NSObject *providerA = [NSObject new], *providerB = [NSObject new];
     NSArray *albumsA = @[Gadget(@"SYNTHETIC-A"), Gadget(@"SYNTHETIC-B")];
@@ -283,12 +392,44 @@ static void TestInventory(void) {
     CHECK(gWrites == 3, "equal inventory across providers does not rewrite");
     HAAlbumProviderSnapshot *snapshot = objc_getAssociatedObject(providerB, &kProviderSnapshotKey);
     CHECK(snapshot.inventory == gRequestedInventory, "equal inventory uses canonical cached array");
+    CHECK(gInventoryNotifications == 3, "successful writes publish one inventory signal each");
 
+    NSObject *pendingProvider = [NSObject new];
+    HATestGadget *pending = Gadget(@"SYNTHETIC-PENDING");
+    pending.testCollection.localizedTitle = nil;
+    NSArray *pendingArray = @[pending];
+    NSUInteger beforePending = gWrites;
+    RecordAlbumsInGadgets(pendingProvider, pendingArray);
+    DrainInventory();
+    CHECK(gWrites == beforePending && gSavedInventory.count == 2,
+          "unready title never overwrites last valid inventory");
+    reads = gCollectionReads;
+    for (NSUInteger i = 0; i < 10000; i++) RecordAlbumsInGadgets(pendingProvider, pendingArray);
+    CHECK(gCollectionReads == reads, "10000 unready snapshot hits never rescan in same lifecycle");
+    pending.testCollection.localizedTitle = @"Ready";
+    gInventoryObservationGeneration++;
+    RecordAlbumsInGadgets(pendingProvider, pendingArray);
+    DrainInventory();
+    CHECK(gWrites == beforePending + 1 && gSavedInventory.count == 1,
+          "foreground generation retries an unready same-array inventory");
+    RecordAlbumsInGadgets(pendingProvider, @[]);
+    DrainInventory();
+    CHECK(gWrites == beforePending + 2 && gSavedInventory.count == 0,
+          "previously loaded provider can clear its inventory");
+    NSObject *initiallyEmpty = [NSObject new];
+    NSUInteger writesBeforeEmpty = gWrites;
+    RecordAlbumsInGadgets(initiallyEmpty, @[]);
+    DrainInventory();
+    CHECK(gWrites == writesBeforeEmpty, "initial loading provider never publishes an empty inventory");
+
+    NSUInteger writesBeforeFailure = gWrites;
+    NSUInteger signalsBeforeFailure = gInventoryNotifications;
     gSynchronizationSucceeds = NO;
     NSArray *failed = @[Gadget(@"SYNTHETIC-RETRY")];
     RecordAlbumsInGadgets(providerA, failed);
     DrainInventory();
-    CHECK(gWrites == 4, "failed synchronization attempted once");
+    CHECK(gWrites == writesBeforeFailure + 1, "failed synchronization attempted once");
+    CHECK(gInventoryNotifications == signalsBeforeFailure, "failed synchronization never signals success");
     // The failure callback is already queued on main. Run assertions after it,
     // without a timer or polling loop, then retry on one explicit provider event.
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -298,10 +439,13 @@ static void TestInventory(void) {
             NSUInteger before = gCollectionReads;
             RecordAlbumsInGadgets(providerA, failed);
             DrainInventory();
-            CHECK(gWrites == 5 && gRequestedInventory != nil, "next natural event retries synchronization");
+            CHECK(gWrites == writesBeforeFailure + 2 && gRequestedInventory != nil,
+                  "next natural event retries synchronization");
+            CHECK(gInventoryNotifications == signalsBeforeFailure + 1,
+                  "successful retry publishes one signal");
             CHECK(gCollectionReads == before, "retry uses parsed provider inventory");
             CHECK(gHookCalls == 0, "test constructor never installed hooks");
-            printf("Synthetic cache tests: %lu assertions, %lu failures; two 10000-hit no-scan checks.\n",
+            printf("Synthetic cache/presentation tests: %lu assertions, %lu failures; four 10000-hit no-scan checks.\n",
                    (unsigned long)gAssertions, (unsigned long)gFailures);
             exit(gFailures == 0 ? 0 : 1);
         }
@@ -312,6 +456,7 @@ int main(void) {
     @autoreleasepool {
         TestCacheAndGeometry();
         TestTitles();
+        TestHiddenPresentation();
         TestInventory();
     }
     dispatch_main();

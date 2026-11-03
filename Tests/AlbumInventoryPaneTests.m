@@ -3,6 +3,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Preferences/PSListController.h>
+#import <notify.h>
+#import <string.h>
 
 static id gInventory;
 static NSUInteger gReads;
@@ -83,8 +85,30 @@ static void Check(BOOL condition, const char *label) {
 - (void)setPreferenceValue:(id)value specifier:(id)specifier { (void)value; (void)specifier; }
 @end
 
+static void (^gInventoryHandler)(int);
+static NSUInteger gNotifyRegistrations;
+static NSUInteger gNotifyCancellations;
+static uint32_t HAPaneRegister(const char *name, int *token, dispatch_queue_t queue,
+                              void (^handler)(int)) {
+    (void)queue;
+    Check(strcmp(name, "local.apelin.synthetic-pane-tests/inventoryChanged") == 0,
+          "pane uses independent inventory signal");
+    *token = 7;
+    gNotifyRegistrations++;
+    gInventoryHandler = [handler copy];
+    return NOTIFY_STATUS_OK;
+}
+static uint32_t HAPaneCancel(int token) {
+    Check(token == 7, "pane cancels its own inventory token");
+    gNotifyCancellations++;
+    gInventoryHandler = nil;
+    return NOTIFY_STATUS_OK;
+}
+
 // Import the production controller unchanged, with only its framework/storage
 // collaborators replaced. No UIKit controller or real preference domain is used.
+#define notify_register_dispatch HAPaneRegister
+#define notify_cancel HAPaneCancel
 #define PSListController HAPaneTestListController
 #define PSSpecifier HAPaneTestSpecifier
 #define NSUserDefaults HAPaneTestDefaults
@@ -93,6 +117,8 @@ static void Check(BOOL condition, const char *label) {
 #undef PSListController
 #undef PSSpecifier
 #undef NSUserDefaults
+#undef notify_register_dispatch
+#undef notify_cancel
 
 static NSDictionary *Album(NSString *identifier, NSString *title) {
     return @{ @"id": identifier, @"title": title };
@@ -157,6 +183,15 @@ static void TestRefresh(void) {
     BecomeActive();
     Check(gReloads == before + 1, "foreground event invalidates stale rows");
     Check([Row(pane, 1).name isEqualToString:@"Album A"], "foreground event replaces initial empty state");
+    Check(gNotifyRegistrations == 1 && gInventoryHandler != nil,
+          "inventory observer registers once");
+    [pane viewDidLoad];
+    Check(gNotifyRegistrations == 1, "view reload never duplicates inventory listener");
+    gInventory = @[Album(@"SYNTHETIC-A", @"Signal A")];
+    gInventoryHandler(7);
+    Check([Row(pane, 1).name isEqualToString:@"Signal A"], "inventory signal refreshes visible page");
+    gInventory = @[Album(@"SYNTHETIC-A", @"Album A")];
+    gInventoryHandler(7);
 
     NSArray *cachedRows = Rows(pane);
     before = gReloads;
@@ -172,7 +207,8 @@ static void TestRefresh(void) {
     reads = gReads;
     gInventory = @[Album(@"SYNTHETIC-B", @"Album B")];
     BecomeActive();
-    Check(gReads == reads, "off-page controller ignores foreground refresh");
+    gInventoryHandler(7);
+    Check(gReads == reads, "off-page controller ignores foreground and inventory refresh");
     [pane viewWillAppear:NO];
     Check([Row(pane, 1).name isEqualToString:@"Album B"], "reopening refreshes reused controller");
 
@@ -189,6 +225,8 @@ static void TestRefresh(void) {
     __weak id weakPane = pane;
     pane = nil;
     Check(weakPane == nil, "event observers do not retain the controller");
+    Check(gNotifyCancellations == 1 && gInventoryHandler == nil,
+          "deallocation cancels inventory listener");
     BecomeActive();
 }
 

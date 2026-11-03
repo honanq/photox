@@ -11,6 +11,7 @@ PSListController、PSSpecifier 和 NSUserDefaults 替换为内存对象。不链
 - 首次空态后收到前台事件会刷新；离页后不在前台事件中读偏好，重新进入会刷新。
 - 相同清单不重建行；改名、数量变化、同数量换序和清空都会更新。
 - 10000 次 specifiers 缓存命中不重复读取偏好；观察者不保留控制器。
+- 独立 inventoryChanged 信号刷新可见子页，重复 viewDidLoad 不重复监听，离页不读偏好，销毁时取消令牌；notify 注册与取消均使用内存替身。
 
 在项目根目录运行。先将 PREFS_INCLUDE 设为本机已注册的 preferences 开发扩展的
 support/include 目录；使用当前路径，不把解析后的 bootstrap 路径保存到仓库。

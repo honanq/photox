@@ -8,7 +8,7 @@
 // HiddenAlbumSettings pane and lives in the com.simon.hidden-album domain.
 //
 // Nine possible hook targets, enabled as needed on these concrete classes:
-//   -[PXPhotosViewModel _updateEmptyPlaceholderState]          the Hidden album
+//   -[PXPhotosViewModel setEmptyPlaceholderState:]             the Hidden album
 //   -[PXGadgetUIViewController collectionView:numberOfItemsInSection:]      \
 //   -[PXGadgetUIViewController collectionView:layout:referenceSize...:]      / 人物与地点
 //   -[PUAlbumsGadgetProvider gadgets]                          the album list
@@ -43,6 +43,7 @@ static BOOL gAutoUnmuteVideo = NO;
 static BOOL gLoaded = NO;
 static BOOL gRestartScheduled = NO;
 static NSUInteger gSettingsGeneration = 0;
+static NSUInteger gInventoryObservationGeneration = 0;
 static NSDictionary<NSString *, NSNumber *> *gHiddenAlbumFlags = nil;
 static void InstallConfiguredHooks(void);
 static dispatch_queue_t AlbumInventoryQueue(void);
@@ -70,6 +71,7 @@ static BOOL AlbumIsHidden(PHAssetCollection *collection) {
 }
 
 static void ReadSettings(void) {
+    gInventoryObservationGeneration++;
     NSDictionary *snapshot = [Preferences() dictionaryRepresentation];
     BOOL album = BoolFromSnapshot(snapshot, @"enabled", YES);
     BOOL peopleAndPlaces = BoolFromSnapshot(snapshot, @"hidePeoplePlaces", YES);
@@ -130,9 +132,14 @@ static BOOL IsHiddenSmartAlbum(PHAssetCollection *collection) {
 - (id)assetCollectionToObserve;
 @end
 
+@interface PXAssetsDataSource : NSObject
+- (id)containerCollection;
+@end
+
 @interface PXPhotosViewModel : NSObject
 - (PXContentPrivacyController *)privacyController;
-- (void)_updateEmptyPlaceholderState;
+- (PXAssetsDataSource *)currentDataSource;
+- (NSInteger)contentPrivacyState;
 @property (nonatomic) NSInteger emptyPlaceholderState;
 @property (nonatomic) NSInteger footerVisibilityStyle;
 @property (nonatomic) BOOL wantsFooterVisible;
@@ -141,7 +148,10 @@ static BOOL IsHiddenSmartAlbum(PHAssetCollection *collection) {
 @interface HAHiddenAlbumPresentationState : NSObject
 @property (nonatomic, weak) PXContentPrivacyController *privacyController;
 @property (nonatomic, strong) id collection;
+@property (nonatomic, weak) id dataSource;
+@property (nonatomic, strong) id sourceCollection;
 @property (nonatomic) BOOL hiddenAlbum;
+@property (nonatomic) BOOL resolvingCollection;
 @property (nonatomic) BOOL footerSuppressed;
 @property (nonatomic) NSInteger savedFooterVisibilityStyle;
 @end
@@ -167,27 +177,28 @@ static void HARestoreFooter(PXPhotosViewModel *model,
     }
 }
 
-static void (*OriginalUpdateEmptyPlaceholderState)(id, SEL);
+static void (*OriginalSetEmptyPlaceholderState)(id, SEL, NSInteger);
 
-static void HookedUpdateEmptyPlaceholderState(id self, SEL _cmd) {
-    OriginalUpdateEmptyPlaceholderState(self, _cmd);
-    if (![NSThread isMainThread]) {
-        return;
-    }
-
+static void HookedSetEmptyPlaceholderState(id self, SEL _cmd, NSInteger requestedState) {
     PXPhotosViewModel *model = (PXPhotosViewModel *)self;
     HAHiddenAlbumPresentationState *state =
         objc_getAssociatedObject(model, &kHiddenPresentationStateKey);
+    if (![NSThread isMainThread] || state.resolvingCollection) {
+        OriginalSetEmptyPlaceholderState(self, _cmd, requestedState);
+        return;
+    }
     if (!gHideHiddenAlbum) {
+        OriginalSetEmptyPlaceholderState(self, _cmd, requestedState);
         HARestoreFooter(model, state);
         return;
     }
 
-    // Read the controller already owned by this exact view model. Never create
-    // a different privacy controller or cache whether authentication succeeded.
+    // Native locked presentation always wins, including a transition whose
+    // controller has changed but whose view-model state has not caught up yet.
     PXContentPrivacyController *privacy = [model privacyController];
-    id collection = [privacy assetCollectionToObserve];
-    if (privacy == nil || collection == nil) {
+    if (privacy == nil || requestedState == 1 || [model contentPrivacyState] == 1 ||
+        [privacy isLocked]) {
+        OriginalSetEmptyPlaceholderState(self, _cmd, requestedState);
         HARestoreFooter(model, state);
         return;
     }
@@ -196,20 +207,36 @@ static void HookedUpdateEmptyPlaceholderState(id self, SEL _cmd) {
         objc_setAssociatedObject(model, &kHiddenPresentationStateKey, state,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+
+    // The observed collection is optional in the native privacy controller.
+    // Resolve this model's displayed collection instead when it is absent.
+    // This is a presentation setter, never a data-source count callback.
+    state.resolvingCollection = YES;
+    id collection = [privacy assetCollectionToObserve];
+    if (![collection isKindOfClass:[PHAssetCollection class]]) {
+        PXAssetsDataSource *source = [model currentDataSource];
+        if (state.dataSource != source || state.sourceCollection == nil) {
+            state.dataSource = source;
+            state.sourceCollection = [source containerCollection];
+        }
+        collection = state.sourceCollection;
+    }
+    state.resolvingCollection = NO;
     if (state.privacyController != privacy || state.collection != collection) {
         state.privacyController = privacy;
         state.collection = collection;
         state.hiddenAlbum = IsHiddenSmartAlbum(collection);
     }
-    if (!state.hiddenAlbum || [privacy isLocked]) {
-        // Keep the original protected presentation, including its unlock button.
+    if (!state.hiddenAlbum) {
+        OriginalSetEmptyPlaceholderState(self, _cmd, requestedState);
         HARestoreFooter(model, state);
         return;
     }
 
-    if (model.emptyPlaceholderState != HAEmptyPlaceholderStateEmpty) {
-        model.emptyPlaceholderState = HAEmptyPlaceholderStateEmpty;
-    }
+    // Enforce at the single publishing boundary, not after one particular
+    // recomputation. Future native presentation updates cannot overwrite it.
+    // The real data source and every authentication method remain untouched.
+    OriginalSetEmptyPlaceholderState(self, _cmd, HAEmptyPlaceholderStateEmpty);
     NSInteger footerStyle = model.footerVisibilityStyle;
     if (!state.footerSuppressed || footerStyle != HAFooterVisibilityStyleNever) {
         state.savedFooterVisibilityStyle = footerStyle;
@@ -320,6 +347,8 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
 @interface HAAlbumProviderSnapshot : NSObject
 @property (nonatomic, weak) NSArray *gadgets;
 @property (nonatomic) NSUInteger count;
+@property (nonatomic) NSUInteger observationGeneration;
+@property (nonatomic) BOOL complete;
 @property (nonatomic, copy) NSArray<NSDictionary *> *inventory;
 @end
 @implementation HAAlbumProviderSnapshot
@@ -327,8 +356,8 @@ static CGSize HookedHeaderSize(id self, SEL _cmd, UICollectionView *collectionVi
 
 static char kProviderSnapshotKey;
 
-static PHAssetCollection *CollectionOfGadget(id gadget) {
-    PHAssetCollection *collection = nil;
+static id DisplayCollectionOfGadget(id gadget) {
+    id collection = nil;
     @try {
         if ([gadget respondsToSelector:@selector(collection)]) {
             collection = [(PUAlbumGadget *)gadget collection];
@@ -336,6 +365,11 @@ static PHAssetCollection *CollectionOfGadget(id gadget) {
     } @catch (NSException *exception) {
         (void)exception;
     }
+    return collection;
+}
+
+static PHAssetCollection *CollectionOfGadget(id gadget) {
+    id collection = DisplayCollectionOfGadget(gadget);
     return [collection isKindOfClass:[PHAssetCollection class]] ? collection : nil;
 }
 
@@ -369,7 +403,10 @@ static NSArray<NSDictionary *> *QueueAlbumInventory(NSArray<NSDictionary *> *alb
         CFPreferencesSetAppValue(CFSTR("albumInventory"),
                                  (__bridge CFPropertyListRef)inventory,
                                  (__bridge CFStringRef)@APELIN_PACKAGE_ID);
-        if (!CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID)) {
+        if (CFPreferencesAppSynchronize((__bridge CFStringRef)@APELIN_PACKAGE_ID)) {
+            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                (__bridge CFStringRef)(@APELIN_PACKAGE_ID "/inventoryChanged"), NULL, NULL, true);
+        } else {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (generation == gInventoryRequestGeneration) {
                     gRequestedInventory = nil;
@@ -385,8 +422,13 @@ static NSArray<NSDictionary *> *QueueAlbumInventory(NSArray<NSDictionary *> *alb
 static void RecordAlbumsInGadgets(id provider, NSArray *gadgets) {
     HAAlbumProviderSnapshot *snapshot =
         objc_getAssociatedObject(provider, &kProviderSnapshotKey);
-    if (snapshot != nil && snapshot.gadgets == gadgets && snapshot.count == gadgets.count) {
-        snapshot.inventory = QueueAlbumInventory(snapshot.inventory);
+    BOOL sameSnapshot = snapshot != nil && snapshot.gadgets == gadgets &&
+                        snapshot.count == gadgets.count;
+    if (sameSnapshot && (snapshot.complete ||
+        snapshot.observationGeneration == gInventoryObservationGeneration)) {
+        if (snapshot.complete) {
+            snapshot.inventory = QueueAlbumInventory(snapshot.inventory);
+        }
         return;
     }
     if (snapshot == nil) {
@@ -394,19 +436,39 @@ static void RecordAlbumsInGadgets(id provider, NSArray *gadgets) {
         objc_setAssociatedObject(provider, &kProviderSnapshotKey, snapshot,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    BOOL previouslyLoaded = snapshot.inventory != nil;
     snapshot.gadgets = gadgets;
     snapshot.count = gadgets.count;
+    snapshot.observationGeneration = gInventoryObservationGeneration;
+    snapshot.complete = NO;
     if (gadgets.count == 0) {
-        snapshot.inventory = nil;  // Ignore a provider that has not loaded yet.
+        // An initially empty provider may still be loading. A previously valid
+        // provider becoming empty can clear its own stale inventory.
+        if (previouslyLoaded) {
+            snapshot.complete = YES;
+            snapshot.inventory = QueueAlbumInventory(@[]);
+        }
         return;
     }
+    BOOL incomplete = NO;
     NSMutableArray<NSDictionary *> *albums = [NSMutableArray arrayWithCapacity:gadgets.count];
     NSMutableSet<NSString *> *seen = [NSMutableSet setWithCapacity:gadgets.count];
     for (id gadget in gadgets) {
-        PHAssetCollection *collection = CollectionOfGadget(gadget);
+        id displayedCollection = DisplayCollectionOfGadget(gadget);
+        if (![displayedCollection isKindOfClass:[PHAssetCollection class]]) {
+            if (displayedCollection == nil && [gadget respondsToSelector:@selector(collection)]) {
+                incomplete = YES;
+            }
+            continue;  // Folder and utility cards are not per-album switches.
+        }
+        PHAssetCollection *collection = displayedCollection;
         NSString *identifier = collection.localIdentifier;
         NSString *title = collection.localizedTitle;
-        if (identifier.length == 0 || title.length == 0 || [seen containsObject:identifier]) {
+        if (identifier.length == 0 || title.length == 0) {
+            incomplete = YES;
+            continue;
+        }
+        if ([seen containsObject:identifier]) {
             continue;
         }
         // People and Places have their own switch above; they are not albums here.
@@ -416,7 +478,10 @@ static void RecordAlbumsInGadgets(id provider, NSArray *gadgets) {
         [seen addObject:identifier];
         [albums addObject:@{@"id": identifier, @"title": title}];
     }
-    snapshot.inventory = QueueAlbumInventory(albums);
+    if (!incomplete && albums.count != 0) {
+        snapshot.complete = YES;
+        snapshot.inventory = QueueAlbumInventory(albums);
+    }
 }
 
 static NSArray *(*OriginalGadgetProviderGadgets)(id, SEL);
@@ -802,28 +867,29 @@ static void InstallConfiguredHooks(void) {
     // setting enables a previously unused feature during a concurrent load.
     atomic_store_explicit(&gWaitingForHookClasses, true, memory_order_relaxed);
     BOOL waiting = NO;
-    if (gHideHiddenAlbum && OriginalUpdateEmptyPlaceholderState == NULL) {
+    if (gHideHiddenAlbum && OriginalSetEmptyPlaceholderState == NULL) {
         Class model = objc_getClass("PXPhotosViewModel");
         Class privacy = objc_getClass("PXContentPrivacyController");
-        if (model == Nil || privacy == Nil) {
+        Class source = objc_getClass("PXAssetsDataSource");
+        if (model == Nil || privacy == Nil || source == Nil) {
             waiting = YES;
         } else {
             BOOL supported = YES;
             SEL selectors[] = {
-                @selector(_updateEmptyPlaceholderState), @selector(privacyController),
-                @selector(emptyPlaceholderState), @selector(setEmptyPlaceholderState:),
+                @selector(privacyController), @selector(currentDataSource),
+                @selector(contentPrivacyState), @selector(setEmptyPlaceholderState:),
                 @selector(footerVisibilityStyle), @selector(setFooterVisibilityStyle:),
                 @selector(wantsFooterVisible), @selector(setWantsFooterVisible:)
             };
             for (NSUInteger i = 0; supported && i < sizeof(selectors) / sizeof(selectors[0]); i++) {
                 supported = [model instancesRespondToSelector:selectors[i]];
             }
-            if (supported &&
+            if (supported && [source instancesRespondToSelector:@selector(containerCollection)] &&
                 [privacy instancesRespondToSelector:@selector(assetCollectionToObserve)] &&
                 [privacy instancesRespondToSelector:@selector(isLocked)]) {
-                HookSelector(model, @selector(_updateEmptyPlaceholderState),
-                             (IMP)HookedUpdateEmptyPlaceholderState,
-                             (IMP *)&OriginalUpdateEmptyPlaceholderState);
+                HookSelector(model, @selector(setEmptyPlaceholderState:),
+                             (IMP)HookedSetEmptyPlaceholderState,
+                             (IMP *)&OriginalSetEmptyPlaceholderState);
             }
         }
     }
