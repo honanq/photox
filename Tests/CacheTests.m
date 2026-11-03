@@ -368,6 +368,171 @@ static void TestHiddenPresentation(void) {
     gHideHiddenAlbum = YES;
 }
 
+@interface HATestGridView : NSObject
+@property (nonatomic, getter=isHidden) BOOL hidden;
+@property (nonatomic) NSUInteger hiddenWrites;
+@end
+@implementation HATestGridView
+- (void)setHidden:(BOOL)hidden { _hidden = hidden; _hiddenWrites++; }
+@end
+
+@interface HATestPhotosController : NSObject
+@property (nonatomic, strong) HATestPhotosModel *viewModel;
+@property (nonatomic, strong) HATestGridView *gridView;
+@property (nonatomic, getter=isViewLoaded) BOOL viewLoaded;
+@property (nonatomic) NSUInteger gridReads;
+@property (nonatomic) NSUInteger nativeCalls;
+@property (nonatomic, strong) id lastConfiguration;
+@property (nonatomic) BOOL nativeUnhidesGrid;
+@end
+@implementation HATestPhotosController
+- (HATestGridView *)gridView { _gridReads++; return _gridView; }
+@end
+
+static void TestOriginalUnavailableUpdate(id object, SEL selector, id configuration) {
+    (void)selector;
+    HATestPhotosController *controller = object;
+    controller.nativeCalls++;
+    controller.lastConfiguration = configuration;
+    if (controller.nativeUnhidesGrid) controller.gridView.hidden = NO;
+}
+
+static void RenderPresentation(HATestPhotosController *controller, id configuration) {
+    HookedUpdateContentUnavailable(controller,
+        NSSelectorFromString(@"_updateContentUnavailableConfigurationUsingState:"), configuration);
+}
+
+static void TestHiddenGridPresentation(void) {
+    OriginalUpdateContentUnavailable = TestOriginalUnavailableUpdate;
+    gHideHiddenAlbum = YES;
+    HATestCollection *hidden = Gadget(@"SYNTHETIC-GRID-HIDDEN").testCollection;
+    hidden.assetCollectionType = PHAssetCollectionTypeSmartAlbum;
+    hidden.assetCollectionSubtype = PHAssetCollectionSubtypeSmartAlbumAllHidden;
+    HATestAssetSource *source = [HATestAssetSource new];
+    source.containerCollection = hidden;
+    HATestPrivacy *privacy = [HATestPrivacy new];
+    privacy.locked = YES;
+    HATestPhotosModel *model = [HATestPhotosModel new];
+    model.privacyController = privacy;
+    model.currentDataSource = source;
+    model.contentPrivacyState = 1;
+    model.emptyPlaceholderState = 1;
+    HATestGridView *grid = [HATestGridView new];
+    HATestPhotosController *controller = [HATestPhotosController new];
+    controller.viewLoaded = YES;
+    controller.viewModel = model;
+    controller.gridView = grid;
+    NSObject *configuration = [NSObject new];
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden && grid.hiddenWrites == 0 && source.collectionReads == 0,
+          "locked native grid is not touched or inspected for album identity");
+    CHECK(controller.nativeCalls == 1 && controller.lastConfiguration == configuration,
+          "native locked configuration receives the original state argument");
+
+    privacy.locked = NO;
+    model.contentPrivacyState = 0;
+    SetPresentation(model, 0);
+    TestOriginalUnavailableUpdate(controller, NULL, configuration);
+    CHECK(model.emptyPlaceholderState == 3 && !grid.isHidden,
+          "regression: empty publication alone does not suppress nonempty native grid");
+    RenderPresentation(controller, configuration);
+    CHECK(grid.isHidden && grid.hiddenWrites == 1,
+          "unlocked Hidden empty configuration also suppresses the concrete grid");
+    NSUInteger reads = source.collectionReads, writes = grid.hiddenWrites;
+    NSUInteger calls = controller.nativeCalls;
+    for (NSUInteger i = 0; i < 10000; i++) RenderPresentation(controller, configuration);
+    CHECK(source.collectionReads == reads && grid.hiddenWrites == writes,
+          "10000 grid updates neither rescan identity nor repeat visibility writes");
+    CHECK(controller.nativeCalls == calls + 10000 && controller.lastConfiguration == configuration,
+          "all cached presentation updates still call native configuration");
+    CHECK(!privacy.locked && model.currentDataSource == source,
+          "grid suppression never changes native privacy or data source");
+    HAHiddenAlbumPresentationState *resolvingState =
+        objc_getAssociatedObject(model, &kHiddenPresentationStateKey);
+    resolvingState.resolvingCollection = YES;
+    RenderPresentation(controller, configuration);
+    CHECK(grid.isHidden && grid.hiddenWrites == writes,
+          "nested identity resolution does not release an active grid override");
+    resolvingState.resolvingCollection = NO;
+    calls = controller.nativeCalls;
+    dispatch_semaphore_t completed = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        RenderPresentation(controller, configuration);
+        dispatch_semaphore_signal(completed);
+    });
+    dispatch_semaphore_wait(completed, DISPATCH_TIME_FOREVER);
+    CHECK(grid.isHidden && grid.hiddenWrites == writes && controller.nativeCalls == calls + 1,
+          "off-main updates call native code without touching grid visibility");
+
+    privacy.locked = YES;
+    model.contentPrivacyState = 1;
+    SetPresentation(model, 1);
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden && model.emptyPlaceholderState == 1,
+          "relocking releases our visibility override and retains native locked state");
+    model.emptyPlaceholderState = 3;
+    model.contentPrivacyState = 0;
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden, "failed or cancelled authentication cannot trust a stale empty state");
+    privacy.locked = NO;
+    model.contentPrivacyState = 1;
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden, "stale native privacy state prevents grid override");
+    model.contentPrivacyState = 0;
+    model.privacyController = nil;
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden, "missing privacy controller cannot activate grid suppression");
+    model.privacyController = privacy;
+    model.emptyPlaceholderState = 0;
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden, "native content without an empty configuration remains untouched");
+    model.emptyPlaceholderState = 2;
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden, "native loading presentation remains untouched");
+    model.emptyPlaceholderState = 3;
+    RenderPresentation(controller, configuration);
+    gHideHiddenAlbum = NO;
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden, "disabling restores the previous grid visibility");
+    gHideHiddenAlbum = YES;
+    RenderPresentation(controller, configuration);
+    privacy.assetCollectionToObserve = Gadget(@"SYNTHETIC-OTHER-GRID").testCollection;
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden, "another album releases Hidden grid suppression even if empty");
+    privacy.assetCollectionToObserve = hidden;
+    RenderPresentation(controller, configuration);
+    HATestGridView *replacement = [HATestGridView new];
+    controller.gridView = replacement;
+    RenderPresentation(controller, configuration);
+    CHECK(!grid.isHidden && replacement.isHidden,
+          "replacing a grid restores the previous view and suppresses the new one");
+    controller.nativeUnhidesGrid = YES;
+    RenderPresentation(controller, configuration);
+    CHECK(replacement.isHidden, "suppression is applied after native configuration updates");
+    controller.nativeUnhidesGrid = NO;
+    controller.gridView = nil;
+    RenderPresentation(controller, configuration);
+    CHECK(!replacement.isHidden &&
+          objc_getAssociatedObject(controller, &kHiddenGridPresentationStateKey) == nil,
+          "a temporarily absent grid restores and releases the old override");
+    controller.gridView = replacement;
+    RenderPresentation(controller, configuration);
+    controller.viewLoaded = NO;
+    reads = controller.gridReads;
+    RenderPresentation(controller, configuration);
+    CHECK(!replacement.isHidden && controller.gridReads == reads,
+          "unloaded controller releases old state without creating or reading a grid");
+    controller.viewLoaded = YES;
+    replacement.hidden = YES;
+    RenderPresentation(controller, configuration);
+    gHideHiddenAlbum = NO;
+    RenderPresentation(controller, configuration);
+    CHECK(replacement.isHidden, "an originally hidden native grid is never forced visible");
+    CHECK(objc_getAssociatedObject(controller, &kHiddenGridPresentationStateKey) == nil,
+          "inactive presentation releases its weak grid state");
+    gHideHiddenAlbum = YES;
+}
+
 static void TestInventory(void) {
     NSObject *providerA = [NSObject new], *providerB = [NSObject new];
     NSArray *albumsA = @[Gadget(@"SYNTHETIC-A"), Gadget(@"SYNTHETIC-B")];
@@ -445,7 +610,7 @@ static void TestInventory(void) {
                   "successful retry publishes one signal");
             CHECK(gCollectionReads == before, "retry uses parsed provider inventory");
             CHECK(gHookCalls == 0, "test constructor never installed hooks");
-            printf("Synthetic cache/presentation tests: %lu assertions, %lu failures; four 10000-hit no-scan checks.\n",
+            printf("Synthetic cache/presentation tests: %lu assertions, %lu failures; five 10000-hit no-scan checks.\n",
                    (unsigned long)gAssertions, (unsigned long)gFailures);
             exit(gFailures == 0 ? 0 : 1);
         }
@@ -457,6 +622,7 @@ int main(void) {
         TestCacheAndGeometry();
         TestTitles();
         TestHiddenPresentation();
+        TestHiddenGridPresentation();
         TestInventory();
     }
     dispatch_main();

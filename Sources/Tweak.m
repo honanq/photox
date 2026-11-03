@@ -177,6 +177,38 @@ static void HARestoreFooter(PXPhotosViewModel *model,
     }
 }
 
+static HAHiddenAlbumPresentationState *HAResolveHiddenPresentationState(
+    PXPhotosViewModel *model, PXContentPrivacyController *privacy) {
+    HAHiddenAlbumPresentationState *state =
+        objc_getAssociatedObject(model, &kHiddenPresentationStateKey);
+    if (state.resolvingCollection) {
+        return nil;
+    }
+    if (state == nil) {
+        state = [HAHiddenAlbumPresentationState new];
+        objc_setAssociatedObject(model, &kHiddenPresentationStateKey, state,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Resolve only at presentation boundaries, never in data-source counts.
+    state.resolvingCollection = YES;
+    id collection = [privacy assetCollectionToObserve];
+    if (![collection isKindOfClass:[PHAssetCollection class]]) {
+        PXAssetsDataSource *source = [model currentDataSource];
+        if (state.dataSource != source || state.sourceCollection == nil) {
+            state.dataSource = source;
+            state.sourceCollection = [source containerCollection];
+        }
+        collection = state.sourceCollection;
+    }
+    state.resolvingCollection = NO;
+    if (state.privacyController != privacy || state.collection != collection) {
+        state.privacyController = privacy;
+        state.collection = collection;
+        state.hiddenAlbum = IsHiddenSmartAlbum(collection);
+    }
+    return state;
+}
+
 static void (*OriginalSetEmptyPlaceholderState)(id, SEL, NSInteger);
 
 static void HookedSetEmptyPlaceholderState(id self, SEL _cmd, NSInteger requestedState) {
@@ -202,31 +234,7 @@ static void HookedSetEmptyPlaceholderState(id self, SEL _cmd, NSInteger requeste
         HARestoreFooter(model, state);
         return;
     }
-    if (state == nil) {
-        state = [HAHiddenAlbumPresentationState new];
-        objc_setAssociatedObject(model, &kHiddenPresentationStateKey, state,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-
-    // The observed collection is optional in the native privacy controller.
-    // Resolve this model's displayed collection instead when it is absent.
-    // This is a presentation setter, never a data-source count callback.
-    state.resolvingCollection = YES;
-    id collection = [privacy assetCollectionToObserve];
-    if (![collection isKindOfClass:[PHAssetCollection class]]) {
-        PXAssetsDataSource *source = [model currentDataSource];
-        if (state.dataSource != source || state.sourceCollection == nil) {
-            state.dataSource = source;
-            state.sourceCollection = [source containerCollection];
-        }
-        collection = state.sourceCollection;
-    }
-    state.resolvingCollection = NO;
-    if (state.privacyController != privacy || state.collection != collection) {
-        state.privacyController = privacy;
-        state.collection = collection;
-        state.hiddenAlbum = IsHiddenSmartAlbum(collection);
-    }
+    state = HAResolveHiddenPresentationState(model, privacy);
     if (!state.hiddenAlbum) {
         OriginalSetEmptyPlaceholderState(self, _cmd, requestedState);
         HARestoreFooter(model, state);
@@ -247,6 +255,82 @@ static void HookedSetEmptyPlaceholderState(id self, SEL _cmd, NSInteger requeste
     }
     if (model.wantsFooterVisible) {
         model.wantsFooterVisible = NO;
+    }
+}
+
+@interface PXPhotosUIViewController : UIViewController
+- (PXPhotosViewModel *)viewModel;
+- (UIView *)gridView;
+@end
+
+@interface HAHiddenGridPresentationState : NSObject
+@property (nonatomic, weak) UIView *gridView;
+@property (nonatomic) BOOL savedHidden;
+@end
+@implementation HAHiddenGridPresentationState
+@end
+
+static char kHiddenGridPresentationStateKey;
+
+static void HARestoreGrid(HAHiddenGridPresentationState *state) {
+    UIView *grid = state.gridView;
+    if (grid.isHidden && !state.savedHidden) {
+        grid.hidden = NO;
+    }
+}
+
+static void HAUpdateHiddenGrid(PXPhotosUIViewController *controller) {
+    HAHiddenGridPresentationState *state =
+        objc_getAssociatedObject(controller, &kHiddenGridPresentationStateKey);
+    BOOL suppress = NO;
+    if (gHideHiddenAlbum && controller.isViewLoaded) {
+        PXPhotosViewModel *model = [controller viewModel];
+        HAHiddenAlbumPresentationState *modelState =
+            objc_getAssociatedObject(model, &kHiddenPresentationStateKey);
+        if (modelState.resolvingCollection) {
+            return; // The outer presentation update owns this same resolution.
+        }
+        PXContentPrivacyController *privacy = [model privacyController];
+        // Never infer authentication from the placeholder alone. Native locking,
+        // cancellation and failure stay entirely in the original implementation.
+        if (privacy != nil && model.emptyPlaceholderState == HAEmptyPlaceholderStateEmpty &&
+            model.contentPrivacyState != 1 && ![privacy isLocked]) {
+            suppress = HAResolveHiddenPresentationState(model, privacy).hiddenAlbum;
+        }
+    }
+    UIView *grid = suppress ? [controller gridView] : nil;
+    if (!suppress || grid == nil) {
+        HARestoreGrid(state);
+        if (state != nil) {
+            objc_setAssociatedObject(controller, &kHiddenGridPresentationStateKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return;
+    }
+    if (state.gridView != grid) {
+        HARestoreGrid(state);
+        if (state == nil) {
+            state = [HAHiddenGridPresentationState new];
+            objc_setAssociatedObject(controller, &kHiddenGridPresentationStateKey, state,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        state.gridView = grid;
+        state.savedHidden = grid.isHidden;
+    }
+    // The system placeholder belongs to the controller, not to this grid.
+    // Hiding the concrete grid suppresses thumbnails, its hit testing and AX,
+    // without changing a data-source count or native contentShouldBeObscured.
+    if (!grid.isHidden) {
+        grid.hidden = YES;
+    }
+}
+
+static void (*OriginalUpdateContentUnavailable)(id, SEL, id);
+
+static void HookedUpdateContentUnavailable(id self, SEL _cmd, id configurationState) {
+    OriginalUpdateContentUnavailable(self, _cmd, configurationState);
+    if ([NSThread isMainThread]) {
+        HAUpdateHiddenGrid((PXPhotosUIViewController *)self);
     }
 }
 
@@ -867,26 +951,42 @@ static void InstallConfiguredHooks(void) {
     // setting enables a previously unused feature during a concurrent load.
     atomic_store_explicit(&gWaitingForHookClasses, true, memory_order_relaxed);
     BOOL waiting = NO;
-    if (gHideHiddenAlbum && OriginalSetEmptyPlaceholderState == NULL) {
+    if (gHideHiddenAlbum &&
+        (OriginalSetEmptyPlaceholderState == NULL || OriginalUpdateContentUnavailable == NULL)) {
         Class model = objc_getClass("PXPhotosViewModel");
         Class privacy = objc_getClass("PXContentPrivacyController");
         Class source = objc_getClass("PXAssetsDataSource");
-        if (model == Nil || privacy == Nil || source == Nil) {
+        Class controller = objc_getClass("PXPhotosUIViewController");
+        Class grid = objc_getClass("PXGView");
+        if (model == Nil || privacy == Nil || source == Nil || controller == Nil || grid == Nil) {
             waiting = YES;
         } else {
             BOOL supported = YES;
             SEL selectors[] = {
                 @selector(privacyController), @selector(currentDataSource),
-                @selector(contentPrivacyState), @selector(setEmptyPlaceholderState:),
+                @selector(contentPrivacyState), @selector(emptyPlaceholderState),
+                @selector(setEmptyPlaceholderState:),
                 @selector(footerVisibilityStyle), @selector(setFooterVisibilityStyle:),
                 @selector(wantsFooterVisible), @selector(setWantsFooterVisible:)
             };
             for (NSUInteger i = 0; supported && i < sizeof(selectors) / sizeof(selectors[0]); i++) {
                 supported = [model instancesRespondToSelector:selectors[i]];
             }
-            if (supported && [source instancesRespondToSelector:@selector(containerCollection)] &&
+            SEL update = NSSelectorFromString(@"_updateContentUnavailableConfigurationUsingState:");
+            Method updateMethod = class_getInstanceMethod(controller, update);
+            BOOL ownUpdate = updateMethod != NULL &&
+                updateMethod != class_getInstanceMethod(class_getSuperclass(controller), update);
+            if (supported && ownUpdate && [grid isSubclassOfClass:[UIView class]] &&
+                [controller instancesRespondToSelector:@selector(viewModel)] &&
+                [controller instancesRespondToSelector:@selector(gridView)] &&
+                [controller instancesRespondToSelector:@selector(isViewLoaded)] &&
+                [source instancesRespondToSelector:@selector(containerCollection)] &&
                 [privacy instancesRespondToSelector:@selector(assetCollectionToObserve)] &&
                 [privacy instancesRespondToSelector:@selector(isLocked)]) {
+                // Require both presentation surfaces; publishing only an empty
+                // configuration leaves the real nonempty grid visible on iOS 17.
+                HookSelector(controller, update, (IMP)HookedUpdateContentUnavailable,
+                             (IMP *)&OriginalUpdateContentUnavailable);
                 HookSelector(model, @selector(setEmptyPlaceholderState:),
                              (IMP)HookedSetEmptyPlaceholderState,
                              (IMP *)&OriginalSetEmptyPlaceholderState);
