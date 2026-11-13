@@ -7,6 +7,7 @@
 // out of the Albums page.
 #import "ApelinBootstrap.h"
 #import <Preferences/PSListController.h>
+#import <Preferences/PSSpecifier.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <notify.h>
 

@@ -7,6 +7,13 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 
+#ifndef APELIN_PACKAGE_ID
+#define APELIN_PACKAGE_ID "com.simon.hidden-album"
+#endif
+#ifndef APELIN_BUILD_ID
+#define APELIN_BUILD_ID "0.1.0"
+#endif
+
 static inline NSString *_Nullable ApelinBootstrapRoot(void) {
 #ifdef APELIN_BOOTSTRAP_ROOTHIDE
     static NSString *root;
