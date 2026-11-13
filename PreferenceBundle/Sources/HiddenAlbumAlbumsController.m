@@ -5,6 +5,7 @@
 // Each switch is stored in the com.simon.hidden-album domain as
 // "hide.<localIdentifier>", which is what the tweak reads to leave that album
 // out of the Albums page.
+#import "ApelinBootstrap.h"
 #import <Preferences/PSListController.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <notify.h>

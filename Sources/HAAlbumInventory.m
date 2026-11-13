@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-#import "HAAlbumInventory.h"
+#import "ApelinBootstrap.h"
 #import <Photos/Photos.h>
 #import <notify.h>
 #import <stdatomic.h>

@@ -7,6 +7,15 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 
+// These identifiers are supplied by Apelin's generated build environment. Keep
+// standalone Theos builds equivalent while allowing generated values to win.
+#ifndef APELIN_PACKAGE_ID
+#define APELIN_PACKAGE_ID "com.simon.hidden-album"
+#endif
+#ifndef APELIN_BUILD_ID
+#define APELIN_BUILD_ID "0.1.0"
+#endif
+
 static inline NSString *_Nullable ApelinBootstrapRoot(void) {
 #ifdef APELIN_BOOTSTRAP_ROOTHIDE
     static NSString *root;
