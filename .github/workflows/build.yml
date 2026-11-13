@@ -1,0 +1,52 @@
+name: Build PhotoX RootHide deb
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Theos (roothide)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$THEOS"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch iOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$THEOS/sdks" /tmp/sdksrc
+          curl -fL --retry 3 -o /tmp/sdks.tar.gz https://codeload.github.com/theos/sdks/tar.gz/refs/heads/master
+          tar -xzf /tmp/sdks.tar.gz -C /tmp/sdksrc sdks-master/iPhoneOS16.5.sdk
+          cp -R /tmp/sdksrc/sdks-master/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk"
+
+      - name: Setup package tools
+        run: |
+          which ldid || brew install ldid
+          make --version | head -1
+
+      - name: Build RootHide package
+        shell: bash
+        run: make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide DEBUG=0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoX-RootHide-deb
+          path: packages/*.deb
+          if-no-files-found: error

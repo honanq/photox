@@ -1,0 +1,9 @@
+Package: com.simon.hidden-album
+Name: 相册增强
+Version: 0.1.0
+Architecture: iphoneos-arm64e
+Description: Photos app album enhancements and controls.
+Maintainer: Simon
+Author: Simon
+Section: Tweaks
+Depends: mobilesubstrate, preferenceloader
